@@ -1,0 +1,32 @@
+[package]
+name = "trusted-relay-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+relay-core = { path = "../crates/relay-core" }
+relay-attest = { path = "../crates/relay-attest" }
+relay-tls = { path = "../crates/relay-tls" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+rustls = { workspace = true, features = ["ring"] }
+tokio-rustls = "0.26"
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2", "service"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+
+[features]
+default = ["tee-mock"]
+tee-mock = ["relay-attest/mock"]
+tee-tdx = ["relay-attest/tdx"]
+tee-sev-snp = ["relay-attest/sev-snp"]
+
+[dev-dependencies]
+relay-sdk = { path = "../crates/relay-sdk" }
+axum = "0.8"
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2", "service"] }

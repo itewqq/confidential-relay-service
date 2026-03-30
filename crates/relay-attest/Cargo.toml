@@ -1,0 +1,31 @@
+[package]
+name = "relay-attest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+rcgen = "0.13"
+x509-parser = { version = "0.16", features = ["verify"] }
+der = { version = "0.7", features = ["alloc"] }
+pem = "3"
+hex = "0.4"
+tracing.workspace = true
+# SEV-SNP: ioctl for /dev/sev-guest (Linux only)
+libc = { version = "0.2", optional = true }
+# SEV-SNP verifier: ECDSA P-384 signature verification for AMD's VCEK chain
+p384 = { version = "0.13", features = ["ecdsa"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+default = ["mock"]
+mock = []
+tdx = ["libc"]
+sev-snp = ["libc", "p384", "reqwest", "tokio"]

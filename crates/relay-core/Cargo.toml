@@ -1,0 +1,21 @@
+[package]
+name = "relay-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-webpki-roots"] }
+rustls.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+futures-util = "0.3"
+bytes = "1"
+http = "1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }

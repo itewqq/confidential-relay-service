@@ -1,0 +1,204 @@
+//! SDK client for connecting to a Trusted Relay server with attested TLS.
+//!
+//! # Security: Fail-closed verifier selection
+//!
+//! For `Strict`, `Audit`, and `TrustOnFirstUse` policies, you **must** either:
+//! - Provide an explicit verifier via `.verifier(Arc::new(SevSnpVerifier))`, or
+//! - Enable the `sev-snp` feature so the SDK can auto-select the correct backend.
+//!
+//! The SDK will **never** silently fall back to mock verification for production
+//! policies. Only `MockDev` uses the mock verifier, and only when the `mock`
+//! feature is enabled.
+
+use std::sync::Arc;
+
+use relay_attest::Verifier;
+use relay_tls::client::attested_client_config;
+
+use crate::types::{ChatRequest, ChatResponse};
+use crate::verify::VerificationPolicy;
+
+/// A client that connects to a Trusted Relay server and verifies its attestation
+/// evidence during the TLS handshake.
+pub struct TrustedRelayClient {
+    endpoint: String,
+    api_key: Option<String>,
+    http_client: reqwest::Client,
+}
+
+/// Builder for [`TrustedRelayClient`].
+pub struct TrustedRelayClientBuilder {
+    endpoint: String,
+    api_key: Option<String>,
+    policy: VerificationPolicy,
+    /// Explicit verifier override. If set, the builder uses this instead of
+    /// auto-selecting based on features. Required for production policies
+    /// unless a TEE feature is enabled.
+    explicit_verifier: Option<Arc<dyn Verifier>>,
+    /// Expected config hash (32 bytes). If set, the client will verify that the
+    /// relay's REPORTDATA includes this config hash, binding the attestation to a
+    /// specific upstream routing configuration.
+    expected_config_hash: Option<[u8; 32]>,
+}
+
+impl TrustedRelayClientBuilder {
+    /// Set the relay server endpoint (e.g. "https://relay.example.com:8443").
+    pub fn endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+
+    /// Set the upstream API key (e.g. your OpenAI key).
+    /// This key is sent in the Authorization header and is encrypted in transit
+    /// via the attested TLS channel.
+    pub fn api_key(mut self, key: impl Into<String>) -> Self {
+        self.api_key = Some(key.into());
+        self
+    }
+
+    /// Set the verification policy.
+    pub fn verification(mut self, policy: VerificationPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Provide an explicit attestation verifier (e.g. `SevSnpVerifier`).
+    ///
+    /// This is required for `Strict`, `Audit`, and `TrustOnFirstUse` policies
+    /// unless a TEE verifier feature (`sev-snp`) is enabled.
+    pub fn verifier(mut self, verifier: Arc<dyn Verifier>) -> Self {
+        self.explicit_verifier = Some(verifier);
+        self
+    }
+
+    /// Set the expected config hash for upstream binding verification.
+    ///
+    /// When set, the client verifies that the relay's attestation REPORTDATA
+    /// includes this config hash, ensuring the relay is configured to talk
+    /// only to the expected upstreams.
+    ///
+    /// The hash should be computed the same way as `RelayConfig::config_hash()`.
+    pub fn expected_config_hash(mut self, hash: [u8; 32]) -> Self {
+        self.expected_config_hash = Some(hash);
+        self
+    }
+
+    /// Build the client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - A production policy (`Strict`/`Audit`/`TOFU`) is used without a verifier
+    ///   and without a TEE verifier feature enabled.
+    /// - `MockDev` is used without the `mock` feature.
+    pub fn build(self) -> anyhow::Result<TrustedRelayClient> {
+        let verifier: Arc<dyn Verifier> = match &self.policy {
+            VerificationPolicy::MockDev => {
+                // MockDev: only use mock verifier, only if explicitly enabled.
+                if self.explicit_verifier.is_some() {
+                    tracing::warn!(
+                        "explicit verifier provided with MockDev policy — using mock verifier instead"
+                    );
+                }
+                #[cfg(feature = "mock")]
+                {
+                    Arc::new(relay_attest::mock::MockVerifier)
+                }
+                #[cfg(not(feature = "mock"))]
+                {
+                    anyhow::bail!("MockDev policy requires the 'mock' feature");
+                }
+            }
+            // Production policies: Strict, Audit, TrustOnFirstUse.
+            // These MUST use a real verifier — never fall back to mock.
+            _production_policy => {
+                if let Some(v) = self.explicit_verifier {
+                    // User provided an explicit verifier — use it.
+                    v
+                } else {
+                    // Auto-select based on enabled features.
+                    // IMPORTANT: mock is NEVER used for production policies.
+                    #[cfg(feature = "sev-snp")]
+                    {
+                        tracing::info!("auto-selected SEV-SNP verifier for production policy");
+                        Arc::new(relay_attest::sev_snp::SevSnpVerifier)
+                    }
+                    #[cfg(all(not(feature = "sev-snp"), feature = "mock"))]
+                    {
+                        // Fail closed: mock feature is enabled but we refuse to use it
+                        // for production policies.
+                        anyhow::bail!(
+                            "production verification policy ({:?}) requires a real TEE verifier. \
+                             Either provide one via .verifier(), enable the 'sev-snp' feature, \
+                             or use VerificationPolicy::MockDev for development.",
+                            self.policy
+                        );
+                    }
+                    #[cfg(all(not(feature = "sev-snp"), not(feature = "mock")))]
+                    {
+                        anyhow::bail!(
+                            "no TEE verifier available for production policy ({:?}). \
+                             Enable the 'sev-snp' feature or provide a verifier via .verifier().",
+                            self.policy
+                        );
+                    }
+                }
+            }
+        };
+
+        let expected_measurement = self.policy.expected_measurement().map(|m| m.to_vec());
+        let tls_config =
+            attested_client_config(verifier, expected_measurement, self.expected_config_hash);
+
+        let http_client = reqwest::Client::builder()
+            .use_preconfigured_tls((*tls_config).clone())
+            .build()?;
+
+        Ok(TrustedRelayClient {
+            endpoint: self.endpoint,
+            api_key: self.api_key,
+            http_client,
+        })
+    }
+}
+
+impl TrustedRelayClient {
+    /// Create a new builder.
+    pub fn builder() -> TrustedRelayClientBuilder {
+        TrustedRelayClientBuilder {
+            endpoint: String::new(),
+            api_key: None,
+            policy: VerificationPolicy::Audit,
+            explicit_verifier: None,
+            expected_config_hash: None,
+        }
+    }
+
+    /// Send a chat completion request through the attested relay.
+    pub async fn chat_completions(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<ChatResponse> {
+        let url = format!(
+            "{}/v1/chat/completions",
+            self.endpoint.trim_end_matches('/')
+        );
+
+        let mut req = self.http_client.post(&url).json(&request);
+
+        if let Some(ref key) = self.api_key {
+            req = req.bearer_auth(key);
+        }
+
+        let resp = req.send().await?;
+        let status = resp.status();
+
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("upstream error {status}: {body}");
+        }
+
+        let chat_response: ChatResponse = resp.json().await?;
+        Ok(chat_response)
+    }
+}
