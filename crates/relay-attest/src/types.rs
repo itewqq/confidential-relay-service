@@ -37,6 +37,9 @@ pub enum AttestError {
     #[error("measurement mismatch: expected {expected}, got {actual}")]
     MeasurementMismatch { expected: String, actual: String },
 
+    #[error("Confidential Space image digest mismatch: expected {expected}, got {actual}")]
+    ImageDigestMismatch { expected: String, actual: String },
+
     #[error("REPORTDATA mismatch")]
     ReportDataMismatch,
 

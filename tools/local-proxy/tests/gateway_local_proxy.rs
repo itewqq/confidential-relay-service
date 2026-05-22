@@ -16,7 +16,7 @@ use relay_attest::types::{Evidence, TeeType};
 #[cfg(feature = "gcp-confidential-space")]
 use relay_attest::Attester;
 use relay_core::config::RelayConfig;
-use relay_core::proxy::AppState;
+use relay_core::proxy::{build_upstream_http_client, AppState};
 use relay_core::router::build_router;
 use relay_core::secrets::{ProviderCredential, ProviderCredentialStore};
 use relay_tls::server::AttestedTlsServer;
@@ -100,9 +100,10 @@ async fn start_attested_relay(
 
     let provider_credentials = ProviderCredentialStore::new();
     provider_credentials.set(provider_credential).await;
+    let http_client = build_upstream_http_client(&config).unwrap();
     let state = AppState {
         config,
-        http_client: reqwest::Client::new(),
+        http_client,
         provider_credentials,
         require_provider_credential: false,
     };
@@ -566,9 +567,10 @@ async fn start_gcp_cs_attested_relay(
     let tls_acceptor = TlsAcceptor::from(tls_server.server_config());
     let provider_credentials = ProviderCredentialStore::new();
     provider_credentials.set(provider_credential).await;
+    let http_client = build_upstream_http_client(&config).unwrap();
     let state = AppState {
         config,
-        http_client: reqwest::Client::new(),
+        http_client,
         provider_credentials,
         require_provider_credential: false,
     };

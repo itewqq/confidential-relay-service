@@ -1564,7 +1564,9 @@ dependencies = [
  "axum",
  "bytes",
  "futures-util",
+ "hex",
  "http",
+ "rcgen",
  "reqwest",
  "rustls",
  "serde",
@@ -1576,6 +1578,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "url",
+ "webpki-roots",
  "zeroize",
 ]
 

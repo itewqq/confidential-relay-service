@@ -100,12 +100,13 @@ ARGS=(
   --shielded-secure-boot
   --shielded-vtpm
   --metadata="$METADATA"
+  --scopes=cloud-platform
   --max-run-duration="$DURATION"
   --instance-termination-action=DELETE
   --quiet
 )
 if [ -n "$SERVICE_ACCOUNT" ]; then
-  ARGS+=(--service-account="$SERVICE_ACCOUNT" --scopes=cloud-platform)
+  ARGS+=(--service-account="$SERVICE_ACCOUNT")
 fi
 
 gcloud "${ARGS[@]}"

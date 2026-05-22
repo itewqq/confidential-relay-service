@@ -3,7 +3,8 @@
 //! Starts an attested TLS server that proxies OpenAI-compatible API requests.
 //! In development mode (--mock), uses mock attestation that works on any platform.
 
-use std::net::SocketAddr;
+use std::collections::BTreeMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -14,7 +15,7 @@ use axum::{Json, Router};
 use clap::Parser;
 use relay_attest::Attester;
 use relay_core::config::RelayConfig;
-use relay_core::proxy::AppState;
+use relay_core::proxy::{build_upstream_http_client, AppState};
 use relay_core::router::build_router;
 use relay_core::secrets::{ProviderCredential, ProviderCredentialStore};
 use relay_tls::server::AttestedTlsServer;
@@ -66,6 +67,15 @@ struct Cli {
     )]
     allowed_upstream: Vec<String>,
 
+    /// Upstream TLS leaf certificate pin in ORIGIN=sha256:<64-hex> form. Repeatable.
+    #[arg(
+        long,
+        env = "TRUSTED_RELAY_UPSTREAM_TLS_LEAF_SHA256",
+        value_delimiter = ',',
+        allow_hyphen_values = true
+    )]
+    upstream_tls_leaf_sha256: Vec<String>,
+
     /// Development-only provider authorization token to use for upstream calls.
     /// Production should inject this through --admin-listen on a private network.
     #[arg(long, env = "TRUSTED_RELAY_PROVIDER_TOKEN")]
@@ -115,12 +125,15 @@ async fn main() -> Result<()> {
 
     // Install the rustls crypto provider (ring) before any TLS operations.
     // This must happen before AttestedTlsServer::new() which calls rustls::ServerConfig::builder().
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("failed to install rustls crypto provider — was it already installed?");
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cli = Cli::parse();
     let require_provider_credential = !cli.allow_client_provider_auth;
+    if cli.allow_client_provider_auth {
+        tracing::warn!(
+            "TRUSTED_RELAY_ALLOW_CLIENT_PROVIDER_AUTH is enabled; this is development-only"
+        );
+    }
 
     // Select attester based on available TEE.
     let attester: Box<dyn Attester> = select_attester();
@@ -147,6 +160,7 @@ async fn main() -> Result<()> {
         max_request_bytes: cli.max_request_bytes,
         release_artifact_digest: cli.release_artifact_digest,
         upstream_timeout_secs: cli.upstream_timeout_secs,
+        upstream_tls_leaf_sha256: parse_upstream_tls_pins(&cli.upstream_tls_leaf_sha256)?,
         ..Default::default()
     });
 
@@ -186,10 +200,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.upstream_timeout_secs))
-        .build()
-        .expect("failed to create HTTP client");
+    let http_client = build_upstream_http_client(&config)?;
 
     let state = AppState {
         config: config.clone(),
@@ -201,6 +212,12 @@ async fn main() -> Result<()> {
     let app = build_router(state);
     if let Some(admin_listen) = cli.admin_listen.as_deref() {
         let admin_addr: SocketAddr = admin_listen.parse()?;
+        if !is_private_admin_ip(admin_addr.ip()) {
+            tracing::warn!(
+                %admin_addr,
+                "private admin endpoint is bound to a non-private address; protect it with firewall/IAP controls"
+            );
+        }
         let admin_listener = TcpListener::bind(admin_addr).await?;
         let admin_app = build_admin_router(provider_credentials.clone());
         tracing::info!(
@@ -255,6 +272,36 @@ async fn main() -> Result<()> {
                 }
             }
         });
+    }
+}
+
+fn parse_upstream_tls_pins(raw: &[String]) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut pins = BTreeMap::<String, Vec<String>>::new();
+    for item in raw {
+        let (origin, pin) = item
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("upstream TLS pin must be ORIGIN=sha256:<64-hex>"))?;
+        pins.entry(origin.to_string())
+            .or_default()
+            .push(pin.to_string());
+    }
+    Ok(pins)
+}
+
+fn is_private_admin_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip == Ipv4Addr::UNSPECIFIED
+                || ip.is_private()
+                || ip.octets()[0] == 169 && ip.octets()[1] == 254
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip == Ipv6Addr::UNSPECIFIED
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
     }
 }
 

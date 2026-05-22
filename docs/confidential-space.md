@@ -50,9 +50,11 @@ tools/gcp/launch-confidential-space.sh \
   --project "$GCP_PROJECT" \
   --zone "$GCP_ZONE" \
   --name trusted-relay-cs \
+  --service-account "$TRUSTED_RELAY_GCP_CS_SERVICE_ACCOUNT" \
   --image-ref "$IMAGE_REF_WITH_DIGEST" \
   --env TRUSTED_RELAY_UPSTREAM="$TRUSTED_RELAY_UPSTREAM" \
   --env TRUSTED_RELAY_ALLOWED_UPSTREAM="$TRUSTED_RELAY_ALLOWED_UPSTREAM" \
+  --env TRUSTED_RELAY_UPSTREAM_TLS_LEAF_SHA256="$TRUSTED_RELAY_UPSTREAM_TLS_LEAF_SHA256" \
   --env TRUSTED_RELAY_RELEASE_ARTIFACT_DIGEST="${IMAGE_DIGEST#sha256:}" \
   --env TRUSTED_RELAY_ADMIN_LISTEN="0.0.0.0:8788" \
   --duration 2h
@@ -61,6 +63,8 @@ tools/gcp/launch-confidential-space.sh \
 Do not pass provider keys through metadata. The image allowlists only non-secret
 runtime configuration and the private admin listener address. Provider keys are
 pushed later from a private operator service to the private admin port.
+`TRUSTED_RELAY_UPSTREAM_TLS_LEAF_SHA256` is non-secret config in
+`ORIGIN=sha256:<64-hex>` form; it is folded into `RelayConfig::config_hash()`.
 
 ## Inject Provider Credential
 
@@ -109,6 +113,7 @@ cargo run -p trusted-relay-online-check --no-default-features \
   --gcp-cs-project-id "$GCP_PROJECT" \
   --gcp-cs-zone "$GCP_ZONE" \
   --expected-config-hash "$TRUSTED_RELAY_EXPECTED_CONFIG_HASH" \
+  --upstream-tls-leaf-sha256 "$TRUSTED_RELAY_UPSTREAM_TLS_LEAF_SHA256" \
   --health
 ```
 

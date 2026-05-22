@@ -12,7 +12,8 @@ authenticate users and meter usage, but it does not terminate attested TLS.
   tokens and forwards opaque bytes to one private relay address.
 - `trusted-relay-server`: private Confidential Space workload. It terminates
   attested TLS, accepts provider credential injection on a private admin port,
-  overwrites local `Authorization`, and forwards only to allowed upstreams.
+  overwrites local `Authorization`, verifies pinned upstream TLS certificates,
+  and forwards only to allowed upstreams.
 - Private operator service: VPC-local service, IAP/SSH tunnel, or equivalent
   control-plane host that can reach the relay admin port and push the provider
   credential after launch.
@@ -68,7 +69,9 @@ curl -fsS -X POST http://RELAY_PRIVATE_IP:8788/admin/provider-credential \
    `503 provider credential not loaded`.
 7. After injection, the relay overwrites any incoming local `Authorization` header
    with the provider credential when calling upstream.
-8. A second injection returns `409 Conflict`; rotate by restarting a fresh CVM
+8. Before request bytes are sent upstream, the relay verifies WebPKI/hostname and
+   any configured `TRUSTED_RELAY_UPSTREAM_TLS_LEAF_SHA256` pins.
+9. A second injection returns `409 Conflict`; rotate by restarting a fresh CVM
    or adding an explicit future rotation protocol.
 
 The admin port is deliberately boring private plumbing. It is not authenticated
@@ -90,6 +93,7 @@ user-to-CVM connection is attested TLS inside the CONNECT tunnel.
 - Firewall allows relay admin port only from the private operator service.
 - Gateway only supports CONNECT to the configured relay address.
 - Local proxy and online checker fail closed without workload identity/config pins.
+- Upstream TLS leaf pins are part of the attested config hash.
 - Provider credential injection is one-shot and never logged.
 - Logs remain metadata-only; prompt, response, provider token, and local user
   token are not logged.

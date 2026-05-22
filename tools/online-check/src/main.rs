@@ -99,6 +99,10 @@ struct Cli {
     #[arg(long, default_value_t = 120)]
     upstream_timeout_secs: u64,
 
+    /// Upstream TLS leaf certificate pin in ORIGIN=sha256:<64-hex> form. Can be repeated.
+    #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+    upstream_tls_leaf_sha256: Vec<String>,
+
     /// Only fetch and print measurement/config/report details; do not enforce strict pins.
     #[arg(long)]
     print_only: bool,
@@ -421,11 +425,25 @@ fn compute_expected_config_hash(cli: &Cli) -> Result<[u8; 32]> {
         max_request_bytes: cli.max_request_bytes,
         release_artifact_digest: cli.release_artifact_digest.clone(),
         upstream_timeout_secs: cli.upstream_timeout_secs,
+        upstream_tls_leaf_sha256: parse_upstream_tls_pins(&cli.upstream_tls_leaf_sha256)?,
     };
     config
         .validate()
         .map_err(|e| anyhow::anyhow!("provided config inputs are invalid: {e}"))?;
     Ok(config.config_hash())
+}
+
+fn parse_upstream_tls_pins(raw: &[String]) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut pins = BTreeMap::<String, Vec<String>>::new();
+    for item in raw {
+        let (origin, pin) = item
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("upstream TLS pin must be ORIGIN=sha256:<64-hex>"))?;
+        pins.entry(origin.to_string())
+            .or_default()
+            .push(pin.to_string());
+    }
+    Ok(pins)
 }
 
 async fn fetch_cert_with_optional_health(endpoint: &Url, health: bool) -> Result<CapturedCert> {

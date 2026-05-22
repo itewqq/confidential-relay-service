@@ -164,7 +164,7 @@ impl TrustedRelayClientBuilder {
                         // There is no safe generic default for Audit/Strict on
                         // Confidential Space because it needs an image policy.
                         anyhow::bail!(
-                            "production verification policy ({:?}) requires a concrete verifier.                              Enable 'sev-snp', provide one via .verifier(), or use                              VerificationPolicy::GcpConfidentialSpace with an image digest.",
+                            "production verification policy ({:?}) requires a concrete verifier. Enable 'sev-snp', provide one via .verifier(), or use VerificationPolicy::GcpConfidentialSpace with an image digest.",
                             self.policy
                         );
                     }

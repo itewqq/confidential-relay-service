@@ -10,7 +10,7 @@
 //! In production, the user pins the workload identity and REPORTDATA-bound
 //! config hash so they can verify which upstreams the relay may contact.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -62,6 +62,13 @@ pub struct RelayConfig {
     /// End-to-end upstream request timeout in seconds.
     #[serde(default = "default_upstream_timeout_secs")]
     pub upstream_timeout_secs: u64,
+
+    /// Optional SHA-256 pins for upstream TLS leaf certificates, keyed by URL
+    /// origin (`https://host:port`). When present for an origin, the relay only
+    /// forwards after the provider certificate matches one of the configured
+    /// pins. This is folded into `config_hash()` so clients can verify it.
+    #[serde(default)]
+    pub upstream_tls_leaf_sha256: BTreeMap<String, Vec<String>>,
 }
 
 /// Configuration for a single upstream provider.
@@ -85,6 +92,7 @@ impl Default for RelayConfig {
             max_request_bytes: default_max_request_bytes(),
             release_artifact_digest: None,
             upstream_timeout_secs: default_upstream_timeout_secs(),
+            upstream_tls_leaf_sha256: BTreeMap::new(),
         }
     }
 }
@@ -104,7 +112,7 @@ fn default_upstream_timeout_secs() -> u64 {
 fn url_origin(raw: &str) -> Option<String> {
     let parsed = Url::parse(raw).ok()?;
     let scheme = parsed.scheme();
-    if !matches!(scheme, "https" | "http") {
+    if scheme != "https" && !is_local_http_url(&parsed) {
         return None;
     }
 
@@ -117,6 +125,16 @@ fn url_origin(raw: &str) -> Option<String> {
     let port = parsed.port_or_known_default()?;
 
     Some(format!("{scheme}://{host}:{port}"))
+}
+
+fn is_local_http_url(parsed: &Url) -> bool {
+    parsed.scheme() == "http"
+        && parsed.host_str().is_some_and(|host| {
+            matches!(
+                host.to_ascii_lowercase().as_str(),
+                "localhost" | "127.0.0.1" | "::1"
+            )
+        })
 }
 
 fn validate_release_artifact_digest(raw: &str) -> Result<(), String> {
@@ -136,6 +154,50 @@ fn validate_release_artifact_digest(raw: &str) -> Result<(), String> {
         return Err("release_artifact_digest must be hex".to_string());
     }
     Ok(())
+}
+
+fn normalize_sha256_pin(raw: &str) -> Option<String> {
+    let pin = raw.trim().to_ascii_lowercase();
+    let hex = pin.strip_prefix("sha256:").unwrap_or(&pin);
+    if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(format!("sha256:{hex}"));
+    }
+    None
+}
+
+fn normalize_upstream_tls_pins(
+    pins: &BTreeMap<String, Vec<String>>,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let mut normalized = BTreeMap::new();
+    for (origin, values) in pins {
+        let parsed = Url::parse(origin)
+            .map_err(|_| format!("upstream TLS pin origin '{origin}' is not a valid URL"))?;
+        if parsed.scheme() != "https" {
+            return Err(format!(
+                "upstream TLS pin origin '{origin}' must use https://"
+            ));
+        }
+        let origin = url_origin(origin).ok_or_else(|| {
+            format!("upstream TLS pin origin '{origin}' is not a valid HTTPS origin")
+        })?;
+        if values.is_empty() {
+            return Err(format!(
+                "upstream TLS pin origin '{origin}' must include at least one sha256 pin"
+            ));
+        }
+        let mut normalized_values = Vec::new();
+        for value in values {
+            let pin = normalize_sha256_pin(value).ok_or_else(|| {
+                format!("upstream TLS pin for '{origin}' must be sha256:<64 hex>, got {value}")
+            })?;
+            if !normalized_values.contains(&pin) {
+                normalized_values.push(pin);
+            }
+        }
+        normalized_values.sort();
+        normalized.insert(origin, normalized_values);
+    }
+    Ok(normalized)
 }
 
 impl RelayConfig {
@@ -196,12 +258,45 @@ impl RelayConfig {
         ))
     }
 
+    /// Return normalized sha256 pins for a resolved upstream origin, if configured.
+    pub fn upstream_tls_pins_for(&self, upstream_url: &str) -> Result<Option<Vec<String>>, String> {
+        let pins = normalize_upstream_tls_pins(&self.upstream_tls_leaf_sha256)?;
+        let origin = url_origin(upstream_url).ok_or_else(|| {
+            format!("upstream URL '{upstream_url}' is not a valid URL (cannot extract origin)")
+        })?;
+        Ok(pins.get(&origin).cloned())
+    }
+
+    /// Return normalized sha256 pins keyed by TLS server name.
+    ///
+    /// Rustls certificate verification receives the SNI/hostname, not the URL
+    /// port, so origins that share a hostname intentionally share the union of
+    /// their configured pins at handshake time.
+    pub fn upstream_tls_pin_hosts(&self) -> Result<BTreeMap<String, Vec<String>>, String> {
+        let pins = normalize_upstream_tls_pins(&self.upstream_tls_leaf_sha256)?;
+        let mut by_host: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (origin, origin_pins) in pins {
+            let parsed = Url::parse(&origin)
+                .map_err(|_| format!("normalized upstream TLS pin origin '{origin}' is invalid"))?;
+            let host = parsed
+                .host_str()
+                .ok_or_else(|| format!("normalized upstream TLS pin origin '{origin}' lacks host"))?
+                .to_ascii_lowercase();
+            by_host.entry(host).or_default().extend(origin_pins);
+        }
+        Ok(by_host
+            .into_iter()
+            .map(|(host, pins)| (host, pins.into_iter().collect()))
+            .collect())
+    }
+
     /// Validate that all configured routes point to allowed upstreams.
     /// Call this at startup to catch misconfiguration early.
     pub fn validate(&self) -> Result<(), String> {
         if let Some(digest) = &self.release_artifact_digest {
             validate_release_artifact_digest(digest)?;
         }
+        normalize_upstream_tls_pins(&self.upstream_tls_leaf_sha256)?;
         if !self.allowed_upstreams.is_empty() {
             // Check default upstream.
             self.check_upstream_allowed(&self.default_upstream)
@@ -273,6 +368,19 @@ impl RelayConfig {
         hasher.update(self.upstream_timeout_secs.to_string().as_bytes());
         hasher.update(b"\n");
 
+        for (origin, pins) in normalize_upstream_tls_pins(&self.upstream_tls_leaf_sha256)
+            .expect("RelayConfig::validate checks upstream TLS pins")
+        {
+            hasher.update(b"upstream_tls_leaf_sha256:");
+            hasher.update(origin.as_bytes());
+            hasher.update(b"=>");
+            for pin in pins {
+                hasher.update(pin.as_bytes());
+                hasher.update(b",");
+            }
+            hasher.update(b"\n");
+        }
+
         hasher.finalize().into()
     }
 }
@@ -293,6 +401,7 @@ mod tests {
             url_origin("http://localhost:3000/v1"),
             Some("http://localhost:3000".into())
         );
+        assert_eq!(url_origin("http://api.openai.com/v1"), None);
     }
 
     #[test]
@@ -545,6 +654,113 @@ mod tests {
         };
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn upstream_tls_pins_are_normalized_by_origin() {
+        let mut pins = BTreeMap::new();
+        pins.insert(
+            "https://API.OpenAI.COM/v1".to_string(),
+            vec!["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()],
+        );
+        let config = RelayConfig {
+            upstream_tls_leaf_sha256: pins,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config
+                .upstream_tls_pins_for("https://api.openai.com/v1/chat/completions")
+                .unwrap(),
+            Some(vec![
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_upstream_tls_pin() {
+        let mut pins = BTreeMap::new();
+        pins.insert(
+            "https://api.openai.com".to_string(),
+            vec!["not-a-pin".to_string()],
+        );
+        let config = RelayConfig {
+            upstream_tls_leaf_sha256: pins,
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_http_upstream_tls_pin_origin() {
+        let mut pins = BTreeMap::new();
+        pins.insert(
+            "http://localhost:3000".to_string(),
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()],
+        );
+        let config = RelayConfig {
+            upstream_tls_leaf_sha256: pins,
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn upstream_tls_pin_hosts_union_same_host_pins() {
+        let mut pins = BTreeMap::new();
+        pins.insert(
+            "https://api.openai.com".to_string(),
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()],
+        );
+        pins.insert(
+            "https://api.openai.com:8443".to_string(),
+            vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()],
+        );
+        let config = RelayConfig {
+            upstream_tls_leaf_sha256: pins,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config
+                .upstream_tls_pin_hosts()
+                .unwrap()
+                .get("api.openai.com"),
+            Some(&vec![
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn config_hash_differs_when_upstream_tls_pin_changes() {
+        let mut pins_a = BTreeMap::new();
+        pins_a.insert(
+            "https://api.openai.com".to_string(),
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()],
+        );
+        let mut pins_b = BTreeMap::new();
+        pins_b.insert(
+            "https://api.openai.com".to_string(),
+            vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()],
+        );
+        let config_a = RelayConfig {
+            upstream_tls_leaf_sha256: pins_a,
+            ..Default::default()
+        };
+        let config_b = RelayConfig {
+            upstream_tls_leaf_sha256: pins_b,
+            ..Default::default()
+        };
+
+        assert_ne!(config_a.config_hash(), config_b.config_hash());
     }
 
     #[test]

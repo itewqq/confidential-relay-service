@@ -10,7 +10,7 @@ use std::time::Duration;
 use relay_attest::mock::{get_mock_measurement, MockAttester, MockVerifier};
 use relay_attest::Verifier;
 use relay_core::config::RelayConfig;
-use relay_core::proxy::AppState;
+use relay_core::proxy::{build_upstream_http_client, AppState};
 use relay_core::router::build_router;
 use relay_core::secrets::{ProviderCredential, ProviderCredentialStore};
 use relay_sdk::client::TrustedRelayClient;
@@ -28,28 +28,40 @@ async fn start_mock_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 async fn start_mock_upstream_with_auth_check(
     expected_auth: Option<&'static str>,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    start_mock_upstream_with_auth_response(expected_auth, None).await
+}
+
+async fn start_mock_upstream_with_auth_response(
+    expected_auth: Option<&'static str>,
+    auth_failure_body: Option<&'static str>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     use axum::extract::State;
-    use axum::http::HeaderMap;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::{IntoResponse, Response};
     use axum::routing::post;
     use axum::Json;
 
     #[derive(Clone)]
     struct UpstreamState {
         expected_auth: Option<&'static str>,
+        auth_failure_body: Option<&'static str>,
     }
 
     async fn fake_chat_completions(
         State(state): State<UpstreamState>,
         headers: HeaderMap,
         body: axum::body::Bytes,
-    ) -> Json<serde_json::Value> {
+    ) -> Response {
         // Parse incoming to verify it's valid JSON.
         let _: serde_json::Value = serde_json::from_slice(&body).unwrap();
         if let Some(expected) = state.expected_auth {
-            assert_eq!(
-                headers.get("authorization").and_then(|v| v.to_str().ok()),
-                Some(expected)
-            );
+            if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(expected) {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    state.auth_failure_body.unwrap_or("invalid api key"),
+                )
+                    .into_response();
+            }
         }
 
         Json(serde_json::json!({
@@ -71,11 +83,15 @@ async fn start_mock_upstream_with_auth_check(
                 "total_tokens": 17
             }
         }))
+        .into_response()
     }
 
     let app = axum::Router::new()
         .route("/v1/chat/completions", post(fake_chat_completions))
-        .with_state(UpstreamState { expected_auth });
+        .with_state(UpstreamState {
+            expected_auth,
+            auth_failure_body,
+        });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -127,7 +143,7 @@ async fn start_relay_server_with_store(
     let tls_server = AttestedTlsServer::new(&attester, Some(&config_hash)).unwrap();
     let tls_acceptor = TlsAcceptor::from(tls_server.server_config());
 
-    let http_client = reqwest::Client::new();
+    let http_client = build_upstream_http_client(&config).unwrap();
     let provider_credentials = ProviderCredentialStore::new();
     if let Some(provider_credential) = provider_credential {
         provider_credentials.set(provider_credential).await;
@@ -430,4 +446,42 @@ async fn private_admin_injection_loads_provider_credential_once() {
         .await
         .unwrap();
     assert_eq!(second.status(), reqwest::StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn injected_provider_auth_failures_do_not_echo_provider_token() {
+    // Some providers echo invalid API key fragments in 401 bodies. The relay
+    // must not forward operator provider-key details to local users.
+    let leaked_body = "invalid_api_key: operator-provider-secret-never-echo";
+    let (upstream_addr, _upstream_handle) = start_mock_upstream_with_auth_response(
+        Some("Bearer other-provider-secret"),
+        Some(leaked_body),
+    )
+    .await;
+
+    let credential = ProviderCredential {
+        auth_scheme: "Bearer".to_string(),
+        token: "operator-provider-secret-never-echo".to_string(),
+    };
+    let (relay_addr, _config_hash, _relay_handle) =
+        start_relay_server_with_credentials(upstream_addr, Some(credential)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = TrustedRelayClient::builder()
+        .endpoint(format!("https://127.0.0.1:{}", relay_addr.port()))
+        .api_key("local-user-token-not-provider-key")
+        .verification(VerificationPolicy::MockDev)
+        .build()
+        .unwrap();
+
+    let error = client
+        .chat_completions(ChatRequest::simple("gpt-4", "Hello"))
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("401 Unauthorized"));
+    assert!(error.contains("upstream provider authentication failed"));
+    assert!(!error.contains("operator-provider-secret-never-echo"));
+    assert!(!error.contains("invalid_api_key"));
 }

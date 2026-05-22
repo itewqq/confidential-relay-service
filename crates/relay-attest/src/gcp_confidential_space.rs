@@ -276,7 +276,8 @@ pub struct GcpConfidentialSpacePolicy {
     /// OIDC issuer. Defaults to Google's Confidential Computing issuer.
     #[serde(default = "default_issuer")]
     pub issuer: String,
-    /// Optional JWKS URI override, mostly for offline tests.
+    /// Optional JWKS URI override. Leave unset for Google's well-known metadata.
+    /// Non-Google issuers are only accepted when this is explicitly set.
     pub jwks_uri: Option<String>,
 }
 
@@ -331,11 +332,7 @@ impl GcpConfidentialSpacePolicy {
     }
 
     pub fn validate(&self) -> Result<(), AttestError> {
-        if self.audience.trim().is_empty() {
-            return Err(AttestError::VerificationFailed(
-                "Confidential Space audience must not be empty".to_string(),
-            ));
-        }
+        self.validate_metadata_sources()?;
         if self.image_digest.is_none() && self.signature_key_ids.is_empty() {
             return Err(AttestError::VerificationFailed(
                 "Confidential Space policy must pin --gcp-cs-image-digest or --gcp-cs-signature-key-id".to_string(),
@@ -343,6 +340,24 @@ impl GcpConfidentialSpacePolicy {
         }
         if let Some(digest) = &self.image_digest {
             validate_image_digest(digest)?;
+        }
+        Ok(())
+    }
+
+    fn validate_metadata_sources(&self) -> Result<(), AttestError> {
+        if self.audience.trim().is_empty() {
+            return Err(AttestError::VerificationFailed(
+                "Confidential Space audience must not be empty".to_string(),
+            ));
+        }
+        validate_https_url(&self.issuer, "Confidential Space issuer")?;
+        if self.issuer.trim_end_matches('/') != DEFAULT_ISSUER && self.jwks_uri.is_none() {
+            return Err(AttestError::VerificationFailed(
+                "custom Confidential Space issuer requires an explicit jwks_uri".to_string(),
+            ));
+        }
+        if let Some(jwks_uri) = &self.jwks_uri {
+            validate_https_url(jwks_uri, "Confidential Space JWKS URI")?;
         }
         Ok(())
     }
@@ -383,6 +398,9 @@ impl GcpConfidentialSpaceVerifier {
     }
 
     pub fn new_audit(policy: GcpConfidentialSpacePolicy) -> Self {
+        if let Err(error) = policy.validate_metadata_sources() {
+            tracing::warn!(%error, "Confidential Space audit policy has invalid metadata sources");
+        }
         Self {
             policy,
             jwks: Arc::new(HttpJwksProvider),
@@ -597,7 +615,7 @@ impl GcpConfidentialSpaceVerifier {
                         )
                     })?;
                 if actual != expected {
-                    return Err(AttestError::MeasurementMismatch { expected, actual });
+                    return Err(AttestError::ImageDigestMismatch { expected, actual });
                 }
             }
             if let Some(expected) = &self.policy.image_reference {
@@ -814,6 +832,22 @@ fn validate_image_digest(raw: &str) -> Result<(), AttestError> {
     if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(AttestError::VerificationFailed(format!(
             "Confidential Space image digest must be sha256:<64 hex>, got {raw}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_https_url(raw: &str, label: &str) -> Result<(), AttestError> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| AttestError::VerificationFailed(format!("{label} is invalid: {e}")))?;
+    if parsed.scheme() != "https" {
+        return Err(AttestError::VerificationFailed(format!(
+            "{label} must use https: {raw}"
+        )));
+    }
+    if parsed.host_str().is_none() || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AttestError::VerificationFailed(format!(
+            "{label} must be an https URL without userinfo: {raw}"
         )));
     }
     Ok(())
@@ -1152,7 +1186,10 @@ mod tests {
         let err = verify_token(&key, tok, &reportdata)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("measurement mismatch"), "{err}");
+        assert!(
+            err.contains("Confidential Space image digest mismatch"),
+            "{err}"
+        );
     }
 
     #[test]
