@@ -189,6 +189,55 @@ HTTP/1.1 503 Service Unavailable
 {"error":{"message":"provider credential not loaded","type":"relay_error"}}
 ```
 
+## May 22, 2026 Real Provider Evidence
+
+A follow-up production-path smoke test used the same reviewed Confidential Space
+image digest as image `A` and a runtime-injected OpenAI provider key. The key was
+kept in `/tmp` only, posted through the private admin endpoint, then deleted.
+The private relay VM had no external IP; Cloud NAT provided egress to OpenAI,
+and IAP local tunnels reached only `8443` and `8788` during the test.
+
+```text
+image_digest=sha256:d6ecd42ffacd6b07b9d8e17be4665e925f9d61b42f198d40f076812e5f2a70be
+relay_config_hash=ba482176c844b171307e90af40fe34cb5a178f3a6c0a886360827980e5072226
+provider_injection=204 No Content
+duplicate_provider_injection=409 Conflict
+admin_health_after_injection={"ok":true,"provider_credential_loaded":true}
+```
+
+Google JWKS was still unreachable from the local network, but the live token was
+verified with the current Google Confidential Space JWKS captured for the run,
+and the request was sent through an attested TLS client using that static JWKS,
+the pinned image digest, service account, project, zone, and config hash.
+
+```text
+jwt.signature=valid
+jwt.issuer=https://confidentialcomputing.googleapis.com
+jwt.audience=trusted-relay-attested-tls
+jwt.swname=CONFIDENTIAL_SPACE
+jwt.dbgstat=disabled-since-boot
+jwt.secboot=true
+jwt.container.image_digest=sha256:d6ecd42ffacd6b07b9d8e17be4665e925f9d61b42f198d40f076812e5f2a70be
+jwt.gce.instance_name=trusted-relay-cs-real
+policy=ok
+```
+
+The attested request reached the real OpenAI upstream and returned successfully:
+
+```text
+HTTP/1.1 200 OK
+model=gpt-4o-mini-2024-07-18
+content=attested relay real provider ok
+usage={prompt_tokens: 17, completion_tokens: 6, total_tokens: 23}
+```
+
+Relay serial logs recorded metadata only:
+
+```text
+provider credential injected through private admin endpoint
+proxied request model=gpt-4o-mini upstream=https://api.openai.com/v1/chat/completions status=200 latency_ms=1631
+```
+
 ## Cleanup
 
 ```bash
