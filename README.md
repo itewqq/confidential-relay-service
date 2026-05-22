@@ -14,59 +14,6 @@ Why build this?
 
 ![Confidential Relay Service architecture](assets/architecture.png)
 
-## Status
-
-This is an under-development research/prototype relay, not a polished hosted
-product. Bug reports, hardening PRs, negative tests, deployment fixes, and
-security reviews are very welcome.
-
-Near-term work should add more upstream providers and more confidential-compute
-backends, for example Anthropic/OpenAI-compatible providers plus AWS Nitro
-Enclaves, Azure Confidential VMs, and other SEV-SNP/TDX platforms.
-
-## What It Is
-
-Trusted Relay has four moving parts:
-
-- `trusted-relay-local`: a user-side local OpenAI-compatible proxy.
-- `trusted-relay-gateway`: a blind HTTP CONNECT gateway for user auth, quota, and billing.
-- `trusted-relay-server`: a private Confidential Space relay that terminates attested TLS.
-- `trusted-relay-online-check`: a live endpoint verifier for release and smoke tests.
-
-The production path uses **Google Cloud Confidential Space**. The local proxy
-verifies a Google-signed attestation token, pins the workload image digest or
-signature, checks the relay config hash, and only then forwards prompts over an
-attested TLS session that terminates inside the private CVM.
-
-## Security Model
-
-### Protected
-
-- **Prompt/API content:** gateway, cloud host, network path, and relay operator do not terminate the attested TLS session.
-- **Trusted code identity:** clients pin `submods.container.image_digest` or an image signature key.
-- **Config identity:** `RelayConfig::config_hash()` covers upstream allowlists, routes, size limits, timeout, and release metadata.
-- **TLS endpoint binding:** attestation nonces bind `SHA-384(TLS SPKI)` to the attested certificate.
-- **Upstream TLS pinning:** the CVM verifies normal WebPKI/hostname plus config-bound upstream leaf SHA-256 pins before sending request bytes.
-- **Provider key separation:** users never receive the provider key; it is injected after CVM launch through a private admin path.
-
-### Not Protected
-
-- The upstream provider sees plaintext. That is the point of calling it.
-- A malicious image that users deliberately pin can still exfiltrate prompts.
-- Side channels, traffic analysis, DoS, compromised clients, provider logging, and Google/AMD firmware bugs are out of scope.
-- The gateway/control plane still sees user identity, IPs, timing, and byte counts.
-- Provider-key injection is operator-scope plumbing, not user-facing attested TLS; protect it with VPC/firewall/IAP/SSH controls.
-
-### Trust Roots
-
-- Google Confidential Space issuer: `https://confidentialcomputing.googleapis.com`.
-- Workload identity: `submods.container.image_digest` and/or `submods.container.image_signatures`.
-- Runtime pins: `swname`, `dbgstat`, `secboot`, service account, project, zone, and optionally instance name.
-- Attested TLS binding: `eat_nonce = SHA-384(SPKI)[0..48] || config_hash[0..16]`.
-
-Raw GCP SEV-SNP `MEASUREMENT` is not the workload identity here; this project
-uses Confidential Space container claims for GCP production.
-
 ## Quick Start
 
 ### 1. Put Secrets In `.env`
@@ -165,6 +112,61 @@ OPENAI_BASE_URL=http://127.0.0.1:11434/v1
 OPENAI_API_KEY=$TRUSTED_RELAY_LOCAL_TOKEN
 ```
 
+## Status
+
+This is an under-development research/prototype relay, not a polished hosted
+product. Bug reports, hardening PRs, negative tests, deployment fixes, and
+security reviews are very welcome.
+
+Near-term work should add more upstream providers and more confidential-compute
+backends, for example Anthropic/OpenAI-compatible providers plus AWS Nitro
+Enclaves, Azure Confidential VMs, and other SEV-SNP/TDX platforms.
+
+## What It Is
+
+Trusted Relay has four moving parts:
+
+- `trusted-relay-local`: a user-side local OpenAI-compatible proxy.
+- `trusted-relay-gateway`: a blind HTTP CONNECT gateway for user auth, quota, and billing.
+- `trusted-relay-server`: a private Confidential Space relay that terminates attested TLS.
+- `trusted-relay-online-check`: a live endpoint verifier for release and smoke tests.
+
+The production path uses **Google Cloud Confidential Space**. The local proxy
+verifies a Google-signed attestation token, pins the workload image digest or
+signature, checks the relay config hash, and only then forwards prompts over an
+attested TLS session that terminates inside the private CVM.
+
+## Security Model
+
+### Protected
+
+- **Prompt/API content from the relay service:** gateway, cloud host, network path, and relay operator do not terminate the attested TLS session.
+- **Relay-side body logging:** the public gateway cannot decrypt prompt/response bodies, and the attested CVM code path does not log or persist request/response bodies.
+- **Trusted code identity:** clients pin `submods.container.image_digest` or an image signature key.
+- **Config identity:** `RelayConfig::config_hash()` covers upstream allowlists, routes, size limits, timeout, and release metadata.
+- **TLS endpoint binding:** attestation nonces bind `SHA-384(TLS SPKI)` to the attested certificate.
+- **Upstream TLS pinning:** the CVM verifies normal WebPKI/hostname plus config-bound upstream leaf SHA-256 pins before sending request bytes.
+- **Provider key separation:** users never receive the provider key; it is injected after CVM launch through a private admin path.
+
+### Not Protected
+
+- The upstream model provider, such as OpenAI or Anthropic, sees plaintext. That is the intended recipient of the request, not the relay operator.
+- A malicious image that users deliberately pin can still exfiltrate prompts.
+- Upstream provider logging, retention, training use, or employee access is governed by that provider; this project does not hide prompts from the selected upstream provider or verify its internal handling.
+- Side channels, traffic analysis, DoS, compromised clients, and Google/AMD firmware bugs are out of scope.
+- The gateway/control plane still sees user identity, IPs, timing, and byte counts.
+- Provider-key injection is operator-scope plumbing, not user-facing attested TLS; protect it with VPC/firewall/IAP/SSH controls.
+
+### Trust Roots
+
+- Google Confidential Space issuer: `https://confidentialcomputing.googleapis.com`.
+- Workload identity: `submods.container.image_digest` and/or `submods.container.image_signatures`.
+- Runtime pins: `swname`, `dbgstat`, `secboot`, service account, project, zone, and optionally instance name.
+- Attested TLS binding: `eat_nonce = SHA-384(SPKI)[0..48] || config_hash[0..16]`.
+
+Raw GCP SEV-SNP `MEASUREMENT` is not the workload identity here; this project
+uses Confidential Space container claims for GCP production.
+
 ## Real Release Test
 
 A real release test must include both paths:
@@ -199,6 +201,6 @@ tools/online-check/        Live endpoint verifier
 - Strict production use requires workload identity pins and `expected_config_hash`.
 - Upstream leaf certificate pins are included in `expected_config_hash`; keep a rotation set ready because public provider leaf certs can rotate.
 - `TrustOnFirstUse` intentionally fails until persistent pinning is implemented.
-- Request and response bodies are not logged; error logs redact token-like text.
+- In the relay-owned code path, request and response bodies are not logged; error logs redact token-like text.
 - Injected-provider `401/403` bodies are sanitized before returning to local users.
 - Run `tools/gcp/cleanup.sh` after throwaway tests and verify cloud resources are gone.
