@@ -35,11 +35,15 @@ delete_instance trusted-relay-cvm-test
 delete_instance trusted-relay-cs
 delete_instance trusted-relay-cs-a
 delete_instance trusted-relay-cs-b
+delete_instance trusted-relay-admin-debug
+delete_instance trusted-relay-operator
 delete_instance trusted-relay-builder
 
 delete_firewall trusted-relay-builder-ssh-alt
 delete_firewall trusted-relay-gateway-connect
 delete_firewall trusted-relay-cvm-private
+delete_firewall trusted-relay-iap-ssh
+delete_firewall trusted-relay-iap-relay
 
 for image in $(gcloud compute images list --project="$PROJECT" --no-standard-images --filter='name~^trusted-relay' --format='value(name)'); do
   gcloud compute images delete "$image" --project="$PROJECT" --quiet
@@ -49,6 +53,26 @@ if [ "$DELETE_ARTIFACT_REPO" = "1" ]; then
   if gcloud artifacts repositories describe "$ARTIFACT_REPO" --location="$REGION" --project="$PROJECT" >/dev/null 2>&1; then
     gcloud artifacts repositories delete "$ARTIFACT_REPO" --location="$REGION" --project="$PROJECT" --quiet
   fi
+fi
+
+if gcloud compute routers nats describe trusted-relay-nat \
+  --router=trusted-relay-nat-router \
+  --router-region="$REGION" \
+  --project="$PROJECT" >/dev/null 2>&1; then
+  gcloud compute routers nats delete trusted-relay-nat \
+    --router=trusted-relay-nat-router \
+    --router-region="$REGION" \
+    --project="$PROJECT" \
+    --quiet
+fi
+
+if gcloud compute routers describe trusted-relay-nat-router \
+  --region="$REGION" \
+  --project="$PROJECT" >/dev/null 2>&1; then
+  gcloud compute routers delete trusted-relay-nat-router \
+    --region="$REGION" \
+    --project="$PROJECT" \
+    --quiet
 fi
 
 project_number=$(gcloud projects describe "$PROJECT" --format='value(projectNumber)' 2>/dev/null || true)

@@ -116,35 +116,77 @@ cargo test -p trusted-relay-server --features tee-mock --test mock_e2e \
   private_admin_injection_loads_provider_credential_once
 ```
 
-## May 21, 2026 Confidential Space A/B Evidence
+## May 22, 2026 Confidential Space A/B Evidence
 
-A real GCP Confidential Space A/B test used a private no-external-IP
-`n2d-standard-2` VM. Image `B` differed from image `A` by a tiny trusted-code
-change: `/health` returned `ok-b` instead of `ok`.
+A real GCP Confidential Space A/B test used private no-external-IP
+`n2d-standard-2` relay VMs in `us-central1-a`. Image `B` differed from image
+`A` by a tiny compiled trusted-code change: `/health` returned `ok-b` instead
+of `ok`. The private admin port was also exercised through IAP after adding
+`EXPOSE 8788` to the Confidential Space image. No provider key was available in
+the environment, so this run verified the production attestation path, private
+admin reachability, and fail-closed behavior before injection; it did not make a
+paid upstream provider request.
 
 ```text
-A image_digest=sha256:3249ef5430208788a5d7b76896e179dfe8a3832504bfbf01aed6549d189c00c8
-B image_digest=sha256:185e319ddfa6e1345f0744702943da31f3537c4bc022b1a2cb21190362964d31
-relay_config_hash=0398418b86ba43b150ef1d83ab0ae2953f5a077409f649b8af6ee9cacb335dd1
+A image_digest=sha256:d6ecd42ffacd6b07b9d8e17be4665e925f9d61b42f198d40f076812e5f2a70be
+A relay_config_hash=ba482176c844b171307e90af40fe34cb5a178f3a6c0a886360827980e5072226
+B image_digest=sha256:5254bf562b5fe4cbc8130bca45a10a4fdb61b228832f14f527494f0903147213
+B relay_config_hash=bcd3a9b2a2a113db3e92e55631d3eec8b6da543927174d2346d37c5189c2b96a
 ```
 
-Pinned to `A`, the strict verifier rejected live `B`:
+Pinned to `A`, the strict verifier accepted live `A`:
 
 ```text
 token.swname=CONFIDENTIAL_SPACE
 token.dbgstat=disabled-since-boot
-token.container.image_digest=sha256:185e319ddfa6e1345f0744702943da31f3537c4bc022b1a2cb21190362964d31
-Error: attestation evidence verification failed
-Caused by:
-    measurement mismatch: expected sha256:3249ef5430208788a5d7b76896e179dfe8a3832504bfbf01aed6549d189c00c8, got sha256:185e319ddfa6e1345f0744702943da31f3537c4bc022b1a2cb21190362964d31
-```
-
-Re-pinning to `B` succeeded:
-
-```text
+token.container.image_digest=sha256:d6ecd42ffacd6b07b9d8e17be4665e925f9d61b42f198d40f076812e5f2a70be
+token.gce.project_id=stone-botany-277908
+token.gce.zone=us-central1-a
 RESULT: OK - GcpConfidentialSpace/Strict verification succeeded
 health.status=HTTP/1.1 200 OK
+health.body=ok
+```
+
+Live `B` reported the changed digest and changed behavior:
+
+```text
+token.container.image_digest=sha256:5254bf562b5fe4cbc8130bca45a10a4fdb61b228832f14f527494f0903147213
+token.gce.instance_name=trusted-relay-cs-b
+health.status=HTTP/1.1 200 OK
 health.body=ok-b
+```
+
+Pinned to `A`, the policy check rejected live `B` after validating the
+Google-signed token fields. The local network could not reach Google's JWKS
+endpoint reliably during this phase, so the JWT signature was verified with the
+Google JWKS fetched out-of-band for the run; the attested token still came from
+the live Confidential Space VM.
+
+```text
+jwt.signature=valid
+jwt.issuer=https://confidentialcomputing.googleapis.com
+jwt.audience=trusted-relay-attested-tls
+jwt.swname=CONFIDENTIAL_SPACE
+jwt.dbgstat=disabled-since-boot
+jwt.secboot=true
+jwt.container.image_digest=sha256:5254bf562b5fe4cbc8130bca45a10a4fdb61b228832f14f527494f0903147213
+Error: image digest mismatch: expected sha256:d6ecd42ffacd6b07b9d8e17be4665e925f9d61b42f198d40f076812e5f2a70be, got sha256:5254bf562b5fe4cbc8130bca45a10a4fdb61b228832f14f527494f0903147213
+```
+
+The user-side local proxy pinned to `A` also failed before forwarding a request
+to live `B`:
+
+```text
+HTTP/1.1 502 Bad Gateway
+{"error":{"message":"relay request failed: client error (Connect)","type":"local_proxy_error"}}
+```
+
+Before provider credential injection, the relay failed closed instead of
+forwarding a local user token upstream:
+
+```text
+HTTP/1.1 503 Service Unavailable
+{"error":{"message":"provider credential not loaded","type":"relay_error"}}
 ```
 
 ## Cleanup

@@ -160,7 +160,7 @@ The real negative test must be a trusted-code change, not just a wrong token:
 5. Expected result: attestation reaches Google token verification, then fails on `container.image_digest` mismatch; no prompt is forwarded.
 
 See `docs/confidential-space.md` and `docs/real-online-test.md` for the detailed
-GCP runbook and the May 21, 2026 A/B result.
+GCP runbook and the May 22, 2026 A/B result.
 
 ## Project Layout
 
