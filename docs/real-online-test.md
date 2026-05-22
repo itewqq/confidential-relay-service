@@ -11,7 +11,8 @@ smoke test.
 - Use `--duration 2h` / `--max-run-duration=2h` for throwaway VMs.
 - Keep the relay private with `--no-address`; use a gateway, IAP tunnel, or SSH
   tunnel from a cheap control host.
-- Use a low-limit provider key in `.env` and inject it through the broker only.
+- Use a low-limit provider key in `.env` and inject it through the private admin
+  endpoint only.
 - Run `tools/gcp/cleanup.sh` and verify Artifact Registry/Compute are empty when done.
 
 ## Production Positive Test
@@ -44,9 +45,7 @@ tools/gcp/launch-confidential-space.sh \
   --env TRUSTED_RELAY_UPSTREAM="$TRUSTED_RELAY_UPSTREAM" \
   --env TRUSTED_RELAY_ALLOWED_UPSTREAM="$TRUSTED_RELAY_ALLOWED_UPSTREAM" \
   --env TRUSTED_RELAY_RELEASE_ARTIFACT_DIGEST="${IMAGE_A_DIGEST#sha256:}" \
-  --env TRUSTED_RELAY_SECRET_BROKER_URL="$TRUSTED_RELAY_SECRET_BROKER_URL" \
-  --env TRUSTED_RELAY_SECRET_BROKER_CA_PEM="$TRUSTED_RELAY_SECRET_BROKER_CA_PEM" \
-  --env TRUSTED_RELAY_SECRET_NONCE="$(uuidgen)" \
+  --env TRUSTED_RELAY_ADMIN_LISTEN="0.0.0.0:8788" \
   --duration 2h
 ```
 
@@ -66,8 +65,14 @@ cargo run -p trusted-relay-online-check --no-default-features \
   --health
 ```
 
-5. Start `trusted-relay-secret-broker` with the same pins, HTTPS PEMs, and
-   `TRUSTED_RELAY_PROVIDER_TOKEN` loaded from `.env`.
+5. Inject the provider credential from a private operator host or temporary
+   private tunnel:
+
+```bash
+curl -fsS -X POST "http://RELAY_PRIVATE_IP:8788/admin/provider-credential" \
+  -H 'content-type: application/json' \
+  -d '{"auth_scheme":"Bearer","token":"'"$TRUSTED_RELAY_PROVIDER_TOKEN"'"}'
+```
 
 6. Start `trusted-relay-local`, then send a normal OpenAI-compatible request to
    `http://127.0.0.1:11434/v1/chat/completions`.
@@ -84,7 +89,7 @@ Expected result:
 
 The negative test must prove trusted-code identity, not merely wrong credentials.
 
-1. Keep image `A` pins in the local proxy, broker, and online checker.
+1. Keep image `A` pins in the local proxy and online checker.
 2. Make a tiny compiled trusted-code change, for example changing the `/health`
    response body.
 3. Build and launch image `B`.
@@ -95,14 +100,20 @@ Expected result:
 - TLS reaches attestation verification;
 - Google token signature and nonce are valid;
 - strict verification fails on `container.image_digest` mismatch;
-- no prompt is forwarded;
-- broker does not release the provider token.
+- no prompt is forwarded.
 
 Local regression coverage:
 
 ```bash
 cargo test -p trusted-relay-local --features gcp-confidential-space --test gateway_local_proxy \
   local_proxy_rejects_changed_confidential_space_container_digest
+```
+
+Provider-injection regression coverage:
+
+```bash
+cargo test -p trusted-relay-server --features tee-mock --test mock_e2e \
+  private_admin_injection_loads_provider_credential_once
 ```
 
 ## May 21, 2026 Confidential Space A/B Evidence

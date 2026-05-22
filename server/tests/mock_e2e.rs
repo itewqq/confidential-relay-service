@@ -98,6 +98,21 @@ async fn start_relay_server_with_credentials(
     upstream_addr: SocketAddr,
     provider_credential: Option<ProviderCredential>,
 ) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+    let (addr, config_hash, handle, _) =
+        start_relay_server_with_store(upstream_addr, provider_credential, false).await;
+    (addr, config_hash, handle)
+}
+
+async fn start_relay_server_with_store(
+    upstream_addr: SocketAddr,
+    provider_credential: Option<ProviderCredential>,
+    require_provider_credential: bool,
+) -> (
+    SocketAddr,
+    [u8; 32],
+    tokio::task::JoinHandle<()>,
+    ProviderCredentialStore,
+) {
     // Install crypto provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -120,7 +135,8 @@ async fn start_relay_server_with_credentials(
     let state = AppState {
         config,
         http_client,
-        provider_credentials,
+        provider_credentials: provider_credentials.clone(),
+        require_provider_credential,
     };
     let app = build_router(state);
 
@@ -151,7 +167,66 @@ async fn start_relay_server_with_credentials(
         }
     });
 
-    (addr, config_hash, handle)
+    (addr, config_hash, handle, provider_credentials)
+}
+
+async fn start_admin_server(
+    provider_credentials: ProviderCredentialStore,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+
+    #[derive(Clone)]
+    struct AdminState {
+        provider_credentials: ProviderCredentialStore,
+    }
+
+    #[derive(serde::Serialize)]
+    struct AdminHealth {
+        ok: bool,
+        provider_credential_loaded: bool,
+    }
+
+    async fn admin_health(State(state): State<AdminState>) -> Json<AdminHealth> {
+        Json(AdminHealth {
+            ok: true,
+            provider_credential_loaded: state.provider_credentials.is_loaded().await,
+        })
+    }
+
+    async fn inject_provider_credential(
+        State(state): State<AdminState>,
+        Json(credential): Json<ProviderCredential>,
+    ) -> StatusCode {
+        if credential.validate().is_err() {
+            return StatusCode::BAD_REQUEST;
+        }
+
+        match state.provider_credentials.set_once(credential).await {
+            Ok(()) => StatusCode::NO_CONTENT,
+            Err(_) => StatusCode::CONFLICT,
+        }
+    }
+
+    let app = Router::new()
+        .route("/admin/health", get(admin_health))
+        .route(
+            "/admin/provider-credential",
+            post(inject_provider_credential),
+        )
+        .with_state(AdminState {
+            provider_credentials,
+        });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (addr, handle)
 }
 
 #[tokio::test]
@@ -289,4 +364,70 @@ async fn e2e_injected_provider_credential_overrides_client_authorization() {
         response.choices[0].message.content,
         "Hello from the mock upstream!"
     );
+}
+
+#[tokio::test]
+async fn private_admin_injection_loads_provider_credential_once() {
+    // 1. Start upstream that only accepts the operator-injected provider credential.
+    let (upstream_addr, _upstream_handle) =
+        start_mock_upstream_with_auth_check(Some("Bearer injected-provider-secret")).await;
+
+    // 2. Start relay in production mode: no credential means fail closed.
+    let (relay_addr, _config_hash, _relay_handle, provider_credentials) =
+        start_relay_server_with_store(upstream_addr, None, true).await;
+    let (admin_addr, _admin_handle) = start_admin_server(provider_credentials).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = TrustedRelayClient::builder()
+        .endpoint(format!("https://127.0.0.1:{}", relay_addr.port()))
+        .api_key("local-user-token-not-provider-key")
+        .verification(VerificationPolicy::MockDev)
+        .build()
+        .unwrap();
+
+    let before_injection = client
+        .chat_completions(ChatRequest::simple("gpt-4", "Hello"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(before_injection.contains("503 Service Unavailable"));
+    assert!(before_injection.contains("provider credential not loaded"));
+
+    let admin = reqwest::Client::new();
+    let first = admin
+        .post(format!(
+            "http://127.0.0.1:{}/admin/provider-credential",
+            admin_addr.port()
+        ))
+        .json(&ProviderCredential {
+            auth_scheme: "Bearer".to_string(),
+            token: "injected-provider-secret".to_string(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let response = client
+        .chat_completions(ChatRequest::simple("gpt-4", "Hello after injection"))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.choices[0].message.content,
+        "Hello from the mock upstream!"
+    );
+
+    let second = admin
+        .post(format!(
+            "http://127.0.0.1:{}/admin/provider-credential",
+            admin_addr.port()
+        ))
+        .json(&ProviderCredential {
+            auth_scheme: "Bearer".to_string(),
+            token: "another-provider-secret".to_string(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), reqwest::StatusCode::CONFLICT);
 }

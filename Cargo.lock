@@ -1597,23 +1597,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "relay-secret"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "hex",
- "relay-attest",
- "relay-core",
- "relay-tls",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "tracing",
-]
-
-[[package]]
 name = "relay-tls"
 version = "0.1.0"
 dependencies = [
@@ -2380,28 +2363,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "trusted-relay-secret-broker"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "hex",
- "hyper-util",
- "relay-attest",
- "relay-core",
- "relay-secret",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "tokio",
- "tokio-rustls",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "trusted-relay-server"
 version = "0.1.0"
 dependencies = [
@@ -2413,7 +2374,6 @@ dependencies = [
  "relay-attest",
  "relay-core",
  "relay-sdk",
- "relay-secret",
  "relay-tls",
  "reqwest",
  "rustls",

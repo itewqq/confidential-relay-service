@@ -7,7 +7,7 @@ edition = "2021"
 relay-core = { path = "../crates/relay-core" }
 relay-attest = { path = "../crates/relay-attest", default-features = false }
 relay-tls = { path = "../crates/relay-tls" }
-relay-secret = { path = "../crates/relay-secret", default-features = false }
+axum = "0.8"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -19,17 +19,14 @@ hex = "0.4"
 rustls = { workspace = true, features = ["ring"] }
 tokio-rustls = "0.26"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2", "service"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 
 [features]
 default = []
-tee-mock = ["relay-attest/mock", "relay-secret/mock"]
+tee-mock = ["relay-attest/mock"]
 tee-tdx = ["relay-attest/tdx"]
-tee-sev-snp = ["relay-attest/sev-snp", "relay-secret/sev-snp"]
-tee-gcp-confidential-space = [
-    "relay-attest/gcp-confidential-space",
-    "relay-secret/gcp-confidential-space",
-]
+tee-sev-snp = ["relay-attest/sev-snp"]
+tee-gcp-confidential-space = ["relay-attest/gcp-confidential-space"]
 tee-sev-snp-with-mock-fallback = ["tee-sev-snp", "tee-mock"]
 
 [dev-dependencies]

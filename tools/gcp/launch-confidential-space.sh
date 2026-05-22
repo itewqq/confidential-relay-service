@@ -20,9 +20,9 @@ Options:
   --log-redirect          Ask Confidential Space to redirect workload logs to serial.
   -h, --help              Show this help.
 
-Required env usually includes non-secret relay config only. Provider keys should
-come from --secret-broker-url or another post-attestation injection path, not be
-baked into the image or metadata.
+Required env usually includes non-secret relay config and optionally
+TRUSTED_RELAY_ADMIN_LISTEN for a private-only injection port. Provider keys must
+be pushed over that private admin path, not baked into the image or metadata.
 USAGE
 }
 

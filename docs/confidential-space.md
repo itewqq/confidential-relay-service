@@ -54,15 +54,34 @@ tools/gcp/launch-confidential-space.sh \
   --env TRUSTED_RELAY_UPSTREAM="$TRUSTED_RELAY_UPSTREAM" \
   --env TRUSTED_RELAY_ALLOWED_UPSTREAM="$TRUSTED_RELAY_ALLOWED_UPSTREAM" \
   --env TRUSTED_RELAY_RELEASE_ARTIFACT_DIGEST="${IMAGE_DIGEST#sha256:}" \
-  --env TRUSTED_RELAY_SECRET_BROKER_URL="$TRUSTED_RELAY_SECRET_BROKER_URL" \
-  --env TRUSTED_RELAY_SECRET_BROKER_CA_PEM="$TRUSTED_RELAY_SECRET_BROKER_CA_PEM" \
-  --env TRUSTED_RELAY_SECRET_NONCE="$(uuidgen)" \
+  --env TRUSTED_RELAY_ADMIN_LISTEN="0.0.0.0:8788" \
   --duration 2h
 ```
 
 Do not pass provider keys through metadata. The image allowlists only non-secret
-runtime configuration. Provider keys come from the secret broker after the relay
-has generated its attested TLS certificate.
+runtime configuration and the private admin listener address. Provider keys are
+pushed later from a private operator service to the private admin port.
+
+## Inject Provider Credential
+
+Run this only from a host that reaches the relay private IP. For throwaway tests,
+that can be a temporary IAP/SSH tunnel or private control host.
+
+```bash
+curl -fsS -X POST "http://RELAY_PRIVATE_IP:8788/admin/provider-credential" \
+  -H 'content-type: application/json' \
+  -d '{"auth_scheme":"Bearer","token":"'"$TRUSTED_RELAY_PROVIDER_TOKEN"'"}'
+```
+
+Check private admin readiness without exposing secrets:
+
+```bash
+curl -fsS "http://RELAY_PRIVATE_IP:8788/admin/health"
+```
+
+The admin listener is not public and not user-facing. Protect it with VPC and
+firewall controls. The user-facing proof remains the attested TLS connection on
+the relay data port.
 
 ## Online Verification
 
@@ -93,7 +112,7 @@ cargo run -p trusted-relay-online-check --no-default-features \
   --health
 ```
 
-The local proxy and broker use the same policy:
+The local proxy uses the same policy:
 
 ```bash
 trusted-relay-local \
@@ -101,23 +120,14 @@ trusted-relay-local \
   --relay-endpoint https://RELAY_PRIVATE_IP:8443 \
   --gateway-addr GATEWAY_PUBLIC_IP:443 \
   --expected-config-hash "$TRUSTED_RELAY_EXPECTED_CONFIG_HASH" \
-  --gcp-cs-image-digest "$IMAGE_DIGEST"
-
-trusted-relay-secret-broker \
-  --backend gcp-confidential-space \
-  --expected-config-hash "$TRUSTED_RELAY_EXPECTED_CONFIG_HASH" \
-  --gcp-cs-image-digest "$IMAGE_DIGEST" \
   --gcp-cs-service-account "$TRUSTED_RELAY_GCP_CS_SERVICE_ACCOUNT" \
   --gcp-cs-project-id "$GCP_PROJECT" \
   --gcp-cs-zone "$GCP_ZONE" \
-  --tls-cert-pem "$TRUSTED_RELAY_SECRET_BROKER_TLS_CERT_PEM" \
-  --tls-key-pem "$TRUSTED_RELAY_SECRET_BROKER_TLS_KEY_PEM" \
-  --provider-token "$TRUSTED_RELAY_PROVIDER_TOKEN"
+  --gcp-cs-image-digest "$IMAGE_DIGEST"
 ```
 
 ## Negative Test
 
 Build image `B` after a small trusted-code change and keep verifiers pinned to
 image `A`. Expected failure is `container.image_digest` mismatch after signature
-and nonce validation. No prompt should be forwarded and no provider credential
-should be released.
+and nonce validation. No prompt should be forwarded.

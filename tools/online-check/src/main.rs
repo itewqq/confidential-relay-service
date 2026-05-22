@@ -420,8 +420,6 @@ fn compute_expected_config_hash(cli: &Cli) -> Result<[u8; 32]> {
         allowed_upstreams,
         max_request_bytes: cli.max_request_bytes,
         release_artifact_digest: cli.release_artifact_digest.clone(),
-        secret_broker_url: None,
-        secret_broker_ca_sha256: None,
         upstream_timeout_secs: cli.upstream_timeout_secs,
     };
     config

@@ -104,6 +104,7 @@ async fn start_attested_relay(
         config,
         http_client: reqwest::Client::new(),
         provider_credentials,
+        require_provider_credential: false,
     };
     let app = build_router(state);
 
@@ -569,6 +570,7 @@ async fn start_gcp_cs_attested_relay(
         config,
         http_client: reqwest::Client::new(),
         provider_credentials,
+        require_provider_credential: false,
     };
     let app = build_router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

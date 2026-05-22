@@ -48,9 +48,9 @@ impl TrustedRelayClientBuilder {
         self
     }
 
-    /// Set the upstream API key (e.g. your OpenAI key).
-    /// This key is sent in the Authorization header and is encrypted in transit
-    /// via the attested TLS channel.
+    /// Set a local compatibility token. `trusted-relay-local` strips this before
+    /// forwarding, and production relays overwrite it with the injected provider
+    /// credential before calling the upstream provider.
     pub fn api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self

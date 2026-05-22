@@ -4,11 +4,9 @@ members = [
     "crates/relay-attest",
     "crates/relay-tls",
     "crates/relay-core",
-    "crates/relay-secret",
     "crates/relay-sdk",
     "server",
     "tools/online-check",
-    "tools/secret-broker",
     "tools/gateway",
     "tools/local-proxy",
 ]

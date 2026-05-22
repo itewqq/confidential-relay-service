@@ -10,6 +10,8 @@ pub enum AppError {
     Upstream { status: StatusCode, body: String },
     /// The client request body exceeded the configured limit.
     PayloadTooLarge { limit: usize },
+    /// The relay has not received its runtime upstream provider credential yet.
+    MissingProviderCredential,
     /// Internal error in the relay.
     Internal(String),
 }
@@ -21,6 +23,7 @@ impl std::fmt::Display for AppError {
             AppError::PayloadTooLarge { limit } => {
                 write!(f, "request body exceeds configured limit of {limit} bytes")
             }
+            AppError::MissingProviderCredential => write!(f, "provider credential not loaded"),
             AppError::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -35,6 +38,11 @@ impl IntoResponse for AppError {
             AppError::PayloadTooLarge { .. } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 r#"{"error":{"message":"request body too large","type":"relay_error"}}"#,
+            )
+                .into_response(),
+            AppError::MissingProviderCredential => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":{"message":"provider credential not loaded","type":"relay_error"}}"#,
             )
                 .into_response(),
             AppError::Internal(msg) => {

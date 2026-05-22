@@ -1,8 +1,8 @@
 //! Provider credential handling for the relay data plane.
 //!
 //! Provider credentials are intentionally runtime inputs. They must not be baked
-//! into the measured image; production deployments should inject them only after
-//! the CVM proves its attested measurement/configuration to a secret broker.
+//! into the measured image or VM metadata; production deployments inject them
+//! through the relay's private admin interface after the CVM starts.
 
 use std::sync::Arc;
 
@@ -40,6 +40,34 @@ impl ProviderCredential {
     ) -> Result<reqwest::header::HeaderValue, http::header::InvalidHeaderValue> {
         reqwest::header::HeaderValue::from_str(&format!("{} {}", self.auth_scheme, self.token))
     }
+
+    /// Validate enough to ensure the credential can become an Authorization
+    /// header without accidentally allowing header splitting.
+    pub fn validate(&self) -> Result<(), String> {
+        let scheme = self.auth_scheme.trim();
+        if scheme.is_empty() {
+            return Err("auth_scheme must not be empty".to_string());
+        }
+        if scheme
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+        {
+            return Err("auth_scheme must be a single HTTP token".to_string());
+        }
+        if self.token.is_empty() {
+            return Err("token must not be empty".to_string());
+        }
+        if self
+            .token
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+        {
+            return Err("token must not contain whitespace or control bytes".to_string());
+        }
+        self.authorization_value()
+            .map_err(|_| "credential is not a valid Authorization header".to_string())?;
+        Ok(())
+    }
 }
 
 /// Shared runtime provider credential state.
@@ -57,7 +85,20 @@ impl ProviderCredentialStore {
         self.inner.read().await.clone()
     }
 
+    pub async fn is_loaded(&self) -> bool {
+        self.inner.read().await.is_some()
+    }
+
     pub async fn set(&self, credential: ProviderCredential) {
         *self.inner.write().await = Some(credential);
+    }
+
+    pub async fn set_once(&self, credential: ProviderCredential) -> Result<(), ProviderCredential> {
+        let mut guard = self.inner.write().await;
+        if guard.is_some() {
+            return Err(credential);
+        }
+        *guard = Some(credential);
+        Ok(())
     }
 }

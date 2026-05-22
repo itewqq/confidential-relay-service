@@ -11,11 +11,11 @@ authenticate users and meter usage, but it does not terminate attested TLS.
 - `trusted-relay-gateway`: public blind CONNECT gateway. It authenticates tunnel
   tokens and forwards opaque bytes to one private relay address.
 - `trusted-relay-server`: private Confidential Space workload. It terminates
-  attested TLS, injects the broker-provided provider credential, and forwards
-  only to allowed upstreams.
-- `trusted-relay-secret-broker`: operator-side broker holding provider keys. It
-  releases them only after workload identity, TLS binding, config hash, and
-  nonce checks pass.
+  attested TLS, accepts provider credential injection on a private admin port,
+  overwrites local `Authorization`, and forwards only to allowed upstreams.
+- Private operator service: VPC-local service, IAP/SSH tunnel, or equivalent
+  control-plane host that can reach the relay admin port and push the provider
+  credential after launch.
 - Upstream provider: OpenAI, Anthropic, or another configured API. It sees
   plaintext by design.
 
@@ -27,7 +27,9 @@ authenticate users and meter usage, but it does not terminate attested TLS.
   users, billing, quotas, abuse controls, and revocation.
 - The CVM is the prompt-handling TCB. It must be private-only and run the pinned
   image/config.
-- The broker is trusted with provider credentials, not prompt plaintext.
+- The private operator service is trusted with provider credentials, but it is
+  outside the user's prompt-confidentiality proof. It must not be on a path that
+  can decrypt attested TLS.
 - User-facing relay tokens are unrelated to provider API keys.
 
 ## Measurement And Report Data
@@ -47,16 +49,32 @@ Raw SEV-SNP `MEASUREMENT` and `REPORTDATA` are different things:
 - `REPORTDATA` is guest-supplied data signed in the report. It binds TLS SPKI and
   config to the attested guest, but it is not a standalone code measurement.
 
-## Secret Handling
+## Provider Credential Handling
 
-1. No provider key is baked into the image or VM metadata.
+1. No provider key is baked into the image, VM metadata, launch env, docs, or Git.
 2. On startup, the relay creates an ephemeral TLS key and attested certificate.
-3. The relay calls the broker with the cert, config hash, and a fresh nonce.
-4. The broker verifies attestation, workload identity, TLS SPKI binding, config
-   hash, and nonce uniqueness.
-5. The broker returns the provider credential once.
-6. The relay overwrites any incoming local `Authorization` header with the
-   provider credential when calling upstream.
+3. The relay exposes the user data-plane on attested TLS (`8443` by default).
+4. If configured, the relay also exposes plain HTTP private admin on
+   `TRUSTED_RELAY_ADMIN_LISTEN`, for example `0.0.0.0:8788` inside a private VPC.
+5. A private operator service pushes the provider credential once:
+
+```bash
+curl -fsS -X POST http://RELAY_PRIVATE_IP:8788/admin/provider-credential \
+  -H 'content-type: application/json' \
+  -d '{"auth_scheme":"Bearer","token":"..."}'
+```
+
+6. Until a credential is loaded, production-mode relay requests fail closed with
+   `503 provider credential not loaded`.
+7. After injection, the relay overwrites any incoming local `Authorization` header
+   with the provider credential when calling upstream.
+8. A second injection returns `409 Conflict`; rotate by restarting a fresh CVM
+   or adding an explicit future rotation protocol.
+
+The admin port is deliberately boring private plumbing. It is not authenticated
+by the relay application and it is not attested TLS. Protect it with network
+controls: no public IP, firewall source ranges or tags, private subnet only, IAP
+or SSH tunnel for manual tests, and metadata/log hygiene.
 
 ## User Auth Model
 
@@ -68,11 +86,11 @@ user-to-CVM connection is attested TLS inside the CONNECT tunnel.
 ## Minimum Deployment Controls
 
 - Relay VM has no external IP.
-- Firewall allows relay port only from the gateway/control-plane subnet.
+- Firewall allows relay data port only from the gateway/control-plane subnet.
+- Firewall allows relay admin port only from the private operator service.
 - Gateway only supports CONNECT to the configured relay address.
-- Local proxy and broker fail closed without workload identity/config pins.
-- Broker requires HTTPS by default; cleartext requires explicit dev-only override.
-- Broker requires one-time nonces.
+- Local proxy and online checker fail closed without workload identity/config pins.
+- Provider credential injection is one-shot and never logged.
 - Logs remain metadata-only; prompt, response, provider token, and local user
   token are not logged.
 - Release automation includes the image A/B negative test.
@@ -83,6 +101,13 @@ Local topology test:
 
 ```bash
 cargo test -p trusted-relay-local --features mock --test gateway_local_proxy
+```
+
+Private injection regression:
+
+```bash
+cargo test -p trusted-relay-server --features tee-mock --test mock_e2e \
+  private_admin_injection_loads_provider_credential_once
 ```
 
 Confidential Space workload-identity negative test:

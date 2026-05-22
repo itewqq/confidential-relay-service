@@ -52,6 +52,7 @@ pub struct AppState {
     pub config: Arc<RelayConfig>,
     pub http_client: reqwest::Client,
     pub provider_credentials: ProviderCredentialStore,
+    pub require_provider_credential: bool,
 }
 
 /// POST /v1/chat/completions — proxy to upstream.
@@ -94,12 +95,17 @@ pub async fn proxy_chat_completions(
             AppError::Internal(format!("upstream not allowed: {e}"))
         })?;
 
-    // Forward only a small allowlist of provider-relevant headers. Do not copy
-    // hop-by-hop or tracing headers that could leak client metadata. If a
-    // provider credential was injected into the CVM, it replaces any client
-    // Authorization header so upstream provider keys never need to leave the CVM.
-    let mut upstream_headers = reqwest::header::HeaderMap::new();
     let provider_credential = state.provider_credentials.get().await;
+    if state.require_provider_credential && provider_credential.is_none() {
+        tracing::warn!("rejecting data-plane request before provider credential injection");
+        return Err(AppError::MissingProviderCredential);
+    }
+
+    // Forward only a small allowlist of provider-relevant headers. Do not copy
+    // hop-by-hop or tracing headers that could leak client metadata. In
+    // production, the injected provider credential replaces any client
+    // Authorization header so provider keys stay in operator-controlled scope.
+    let mut upstream_headers = reqwest::header::HeaderMap::new();
     for header_name in FORWARDED_REQUEST_HEADERS {
         if *header_name == "authorization" && provider_credential.is_some() {
             continue;

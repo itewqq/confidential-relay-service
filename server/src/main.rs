@@ -7,6 +7,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use clap::Parser;
 use relay_attest::Attester;
 use relay_core::config::RelayConfig;
@@ -62,7 +66,8 @@ struct Cli {
     )]
     allowed_upstream: Vec<String>,
 
-    /// Provider authorization token to use for upstream calls. Prefer --secret-broker-url in production.
+    /// Development-only provider authorization token to use for upstream calls.
+    /// Production should inject this through --admin-listen on a private network.
     #[arg(long, env = "TRUSTED_RELAY_PROVIDER_TOKEN")]
     provider_token: Option<String>,
 
@@ -74,21 +79,29 @@ struct Cli {
     )]
     provider_auth_scheme: String,
 
-    /// Secret broker endpoint. If set, the relay fetches the provider credential after attested TLS is created.
-    #[arg(long, env = "TRUSTED_RELAY_SECRET_BROKER_URL")]
-    secret_broker_url: Option<String>,
+    /// Private HTTP admin listen address for one-shot provider credential injection.
+    /// Bind this only on localhost or a private subnet and protect it with firewall rules.
+    #[arg(long, env = "TRUSTED_RELAY_ADMIN_LISTEN")]
+    admin_listen: Option<String>,
 
-    /// PEM bundle containing the private CA roots used to authenticate the secret broker.
-    #[arg(long, env = "TRUSTED_RELAY_SECRET_BROKER_CA_PEM")]
-    secret_broker_ca_pem: Option<String>,
-
-    /// One-time nonce included in the secret broker request. Required with --secret-broker-url.
-    #[arg(long, env = "TRUSTED_RELAY_SECRET_NONCE")]
-    secret_nonce: Option<String>,
+    /// Development escape hatch: forward client Authorization if no provider credential was injected.
+    #[arg(long, env = "TRUSTED_RELAY_ALLOW_CLIENT_PROVIDER_AUTH")]
+    allow_client_provider_auth: bool,
 
     /// Published release/workload artifact sha256 digest to bind into config_hash/REPORTDATA.
     #[arg(long, env = "TRUSTED_RELAY_RELEASE_ARTIFACT_DIGEST")]
     release_artifact_digest: Option<String>,
+}
+
+#[derive(Clone)]
+struct AdminState {
+    provider_credentials: ProviderCredentialStore,
+}
+
+#[derive(serde::Serialize)]
+struct AdminHealth {
+    ok: bool,
+    provider_credential_loaded: bool,
 }
 
 #[tokio::main]
@@ -107,11 +120,7 @@ async fn main() -> Result<()> {
         .expect("failed to install rustls crypto provider — was it already installed?");
 
     let cli = Cli::parse();
-    if cli.provider_token.is_some() && cli.secret_broker_url.is_some() {
-        anyhow::bail!(
-            "use either --provider-token or --secret-broker-url, not both; production should use --secret-broker-url"
-        );
-    }
+    let require_provider_credential = !cli.allow_client_provider_auth;
 
     // Select attester based on available TEE.
     let attester: Box<dyn Attester> = select_attester();
@@ -137,11 +146,6 @@ async fn main() -> Result<()> {
         allowed_upstreams,
         max_request_bytes: cli.max_request_bytes,
         release_artifact_digest: cli.release_artifact_digest,
-        secret_broker_url: cli.secret_broker_url.clone(),
-        secret_broker_ca_sha256: cli
-            .secret_broker_ca_pem
-            .as_deref()
-            .map(|pem| relay_secret::sha256_hex_bytes(pem.as_bytes())),
         upstream_timeout_secs: cli.upstream_timeout_secs,
         ..Default::default()
     });
@@ -177,29 +181,9 @@ async fn main() -> Result<()> {
                 token: provider_token,
             })
             .await;
-        tracing::info!("provider credential loaded from runtime token source");
-    }
-    if let Some(secret_broker_url) = cli.secret_broker_url.as_deref() {
-        let secret_nonce = cli.secret_nonce.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "--secret-nonce or TRUSTED_RELAY_SECRET_NONCE is required with --secret-broker-url"
-            )
-        })?;
-        if secret_nonce.trim().len() < 16 {
-            anyhow::bail!(
-                "--secret-nonce must be a fresh high-entropy value of at least 16 characters"
-            );
-        }
-        let credential = relay_secret::fetch_provider_credential(
-            secret_broker_url,
-            cli.secret_broker_ca_pem.as_deref(),
-            tls_server.cert_der(),
-            config_hash,
-            secret_nonce.to_string(),
-        )
-        .await?;
-        provider_credentials.set(credential).await;
-        tracing::info!("provider credential fetched from attested secret broker");
+        tracing::warn!(
+            "provider credential loaded from CLI/env; use private admin injection in production"
+        );
     }
 
     let http_client = reqwest::Client::builder()
@@ -210,10 +194,33 @@ async fn main() -> Result<()> {
     let state = AppState {
         config: config.clone(),
         http_client,
-        provider_credentials,
+        provider_credentials: provider_credentials.clone(),
+        require_provider_credential,
     };
 
     let app = build_router(state);
+    if let Some(admin_listen) = cli.admin_listen.as_deref() {
+        let admin_addr: SocketAddr = admin_listen.parse()?;
+        let admin_listener = TcpListener::bind(admin_addr).await?;
+        let admin_app = build_admin_router(provider_credentials.clone());
+        tracing::info!(
+            %admin_addr,
+            "private admin injection endpoint listening; protect this address with VPC/firewall"
+        );
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(admin_listener, admin_app).await {
+                tracing::error!(error = %e, "private admin server stopped");
+            }
+        });
+    } else if provider_credentials.is_loaded().await {
+        tracing::info!(
+            "private admin injection endpoint disabled; provider credential already loaded"
+        );
+    } else if require_provider_credential {
+        tracing::warn!(
+            "private admin injection endpoint disabled and no provider credential loaded; data-plane requests will fail closed"
+        );
+    }
 
     // Bind and serve.
     let addr: SocketAddr = cli.listen.parse()?;
@@ -248,6 +255,47 @@ async fn main() -> Result<()> {
                 }
             }
         });
+    }
+}
+
+fn build_admin_router(provider_credentials: ProviderCredentialStore) -> Router {
+    let state = AdminState {
+        provider_credentials,
+    };
+    Router::new()
+        .route("/admin/health", get(admin_health))
+        .route(
+            "/admin/provider-credential",
+            post(inject_provider_credential),
+        )
+        .with_state(state)
+}
+
+async fn admin_health(State(state): State<AdminState>) -> Json<AdminHealth> {
+    Json(AdminHealth {
+        ok: true,
+        provider_credential_loaded: state.provider_credentials.is_loaded().await,
+    })
+}
+
+async fn inject_provider_credential(
+    State(state): State<AdminState>,
+    Json(credential): Json<ProviderCredential>,
+) -> StatusCode {
+    if let Err(e) = credential.validate() {
+        tracing::warn!(error = %e, "rejected invalid provider credential injection");
+        return StatusCode::BAD_REQUEST;
+    }
+
+    match state.provider_credentials.set_once(credential).await {
+        Ok(()) => {
+            tracing::info!("provider credential injected through private admin endpoint");
+            StatusCode::NO_CONTENT
+        }
+        Err(_) => {
+            tracing::warn!("rejected duplicate provider credential injection");
+            StatusCode::CONFLICT
+        }
     }
 }
 

@@ -7,9 +7,8 @@
 //! **refuse** to forward to any URL whose **origin** (scheme + host + port) does
 //! not match one of the entries.
 //!
-//! In a production deployment, the allowed upstreams should be baked into the
-//! binary or configuration that is included in the TEE measurement, so users can
-//! verify the relay will only talk to known-good providers.
+//! In production, the user pins the workload identity and REPORTDATA-bound
+//! config hash so they can verify which upstreams the relay may contact.
 
 use std::collections::BTreeMap;
 
@@ -51,27 +50,14 @@ pub struct RelayConfig {
     ///
     /// This is non-secret release metadata. When set, it is folded into
     /// `config_hash()` and therefore into REPORTDATA bytes 48..64. It lets the
-    /// local proxy and secret broker pin a reviewed image or release digest in
-    /// addition to the platform TEE measurement. On platforms where the raw
+    /// local proxy pin a reviewed image or release digest in addition to the
+    /// platform TEE measurement. On platforms where the raw
     /// SEV-SNP launch measurement does not identify the custom workload bytes,
     /// this binding is necessary but still must be backed by a platform
     /// workload-image attestation mechanism such as vTPM measured boot or
     /// Confidential Space image-digest claims.
     #[serde(default)]
     pub release_artifact_digest: Option<String>,
-
-    /// Secret broker URL used for post-attestation provider credential release.
-    ///
-    /// This is not secret, but it is security-critical: changing it can change
-    /// who supplies the upstream provider credential. It is therefore folded
-    /// into `config_hash()` when set.
-    #[serde(default)]
-    pub secret_broker_url: Option<String>,
-
-    /// SHA-256 digest of the broker CA material trusted by the relay, when a
-    /// private CA is configured through `relay-secret`.
-    #[serde(default)]
-    pub secret_broker_ca_sha256: Option<String>,
 
     /// End-to-end upstream request timeout in seconds.
     #[serde(default = "default_upstream_timeout_secs")]
@@ -98,8 +84,6 @@ impl Default for RelayConfig {
             allowed_upstreams: Vec::new(),
             max_request_bytes: default_max_request_bytes(),
             release_artifact_digest: None,
-            secret_broker_url: None,
-            secret_broker_ca_sha256: None,
             upstream_timeout_secs: default_upstream_timeout_secs(),
         }
     }
@@ -150,34 +134,6 @@ fn validate_release_artifact_digest(raw: &str) -> Result<(), String> {
     }
     if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("release_artifact_digest must be hex".to_string());
-    }
-    Ok(())
-}
-
-fn validate_sha256_hex(label: &str, raw: &str) -> Result<(), String> {
-    let digest = raw.trim();
-    if digest.len() != 64 {
-        return Err(format!(
-            "{label} must be a 32-byte sha256 hex digest, got {} hex chars",
-            digest.len()
-        ));
-    }
-    if !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("{label} must be hex"));
-    }
-    Ok(())
-}
-
-fn validate_secret_broker_url(raw: &str) -> Result<(), String> {
-    let parsed = Url::parse(raw).map_err(|e| format!("secret_broker_url is invalid: {e}"))?;
-    if parsed.scheme() != "https" {
-        return Err("secret_broker_url must use https:// in attested configuration".to_string());
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err("secret_broker_url must not contain userinfo".to_string());
-    }
-    if parsed.host_str().is_none() {
-        return Err("secret_broker_url must include a host".to_string());
     }
     Ok(())
 }
@@ -246,13 +202,6 @@ impl RelayConfig {
         if let Some(digest) = &self.release_artifact_digest {
             validate_release_artifact_digest(digest)?;
         }
-        if let Some(url) = &self.secret_broker_url {
-            validate_secret_broker_url(url)?;
-        }
-        if let Some(digest) = &self.secret_broker_ca_sha256 {
-            validate_sha256_hex("secret_broker_ca_sha256", digest)?;
-        }
-
         if !self.allowed_upstreams.is_empty() {
             // Check default upstream.
             self.check_upstream_allowed(&self.default_upstream)
@@ -316,18 +265,6 @@ impl RelayConfig {
 
         if let Some(digest) = &self.release_artifact_digest {
             hasher.update(b"release_artifact_digest:");
-            hasher.update(digest.trim().to_ascii_lowercase().as_bytes());
-            hasher.update(b"\n");
-        }
-
-        if let Some(url) = &self.secret_broker_url {
-            hasher.update(b"secret_broker_url:");
-            hasher.update(url.trim().as_bytes());
-            hasher.update(b"\n");
-        }
-
-        if let Some(digest) = &self.secret_broker_ca_sha256 {
-            hasher.update(b"secret_broker_ca_sha256:");
             hasher.update(digest.trim().to_ascii_lowercase().as_bytes());
             hasher.update(b"\n");
         }
@@ -601,53 +538,9 @@ mod tests {
     }
 
     #[test]
-    fn config_hash_differs_when_secret_broker_identity_changes() {
-        let config_a = RelayConfig {
-            secret_broker_url: Some("https://broker-a.internal:8787/v1/secret/provider".into()),
-            secret_broker_ca_sha256: Some(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            ),
-            ..Default::default()
-        };
-        let config_b = RelayConfig {
-            secret_broker_url: Some("https://broker-b.internal:8787/v1/secret/provider".into()),
-            secret_broker_ca_sha256: Some(
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-            ),
-            ..Default::default()
-        };
-
-        assert_ne!(
-            config_a.config_hash(),
-            config_b.config_hash(),
-            "broker URL/CA changes must alter the config hash bound into REPORTDATA"
-        );
-    }
-
-    #[test]
     fn validate_rejects_bad_release_artifact_digest() {
         let config = RelayConfig {
             release_artifact_digest: Some("not-a-digest".to_string()),
-            ..Default::default()
-        };
-
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_insecure_secret_broker_url() {
-        let config = RelayConfig {
-            secret_broker_url: Some("http://broker.internal:8787/v1/secret/provider".into()),
-            ..Default::default()
-        };
-
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_bad_secret_broker_ca_digest() {
-        let config = RelayConfig {
-            secret_broker_ca_sha256: Some("not-a-digest".to_string()),
             ..Default::default()
         };
 
