@@ -71,6 +71,7 @@ user-to-CVM connection is attested TLS inside the CONNECT tunnel.
 - Firewall allows relay port only from the gateway/control-plane subnet.
 - Gateway only supports CONNECT to the configured relay address.
 - Local proxy and broker fail closed without workload identity/config pins.
+- Broker requires HTTPS by default; cleartext requires explicit dev-only override.
 - Broker requires one-time nonces.
 - Logs remain metadata-only; prompt, response, provider token, and local user
   token are not logged.
