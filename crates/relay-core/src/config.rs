@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 /// Top-level configuration for the relay server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +42,40 @@ pub struct RelayConfig {
     /// In production, this should be baked into the measured binary/config.
     #[serde(default)]
     pub allowed_upstreams: Vec<String>,
+
+    /// Maximum accepted request body size in bytes.
+    #[serde(default = "default_max_request_bytes")]
+    pub max_request_bytes: usize,
+
+    /// Release/workload artifact digest published for this deployment.
+    ///
+    /// This is non-secret release metadata. When set, it is folded into
+    /// `config_hash()` and therefore into REPORTDATA bytes 48..64. It lets the
+    /// local proxy and secret broker pin a reviewed image or release digest in
+    /// addition to the platform TEE measurement. On platforms where the raw
+    /// SEV-SNP launch measurement does not identify the custom workload bytes,
+    /// this binding is necessary but still must be backed by a platform
+    /// workload-image attestation mechanism such as vTPM measured boot or
+    /// Confidential Space image-digest claims.
+    #[serde(default)]
+    pub release_artifact_digest: Option<String>,
+
+    /// Secret broker URL used for post-attestation provider credential release.
+    ///
+    /// This is not secret, but it is security-critical: changing it can change
+    /// who supplies the upstream provider credential. It is therefore folded
+    /// into `config_hash()` when set.
+    #[serde(default)]
+    pub secret_broker_url: Option<String>,
+
+    /// SHA-256 digest of the broker CA material trusted by the relay, when a
+    /// private CA is configured through `relay-secret`.
+    #[serde(default)]
+    pub secret_broker_ca_sha256: Option<String>,
+
+    /// End-to-end upstream request timeout in seconds.
+    #[serde(default = "default_upstream_timeout_secs")]
+    pub upstream_timeout_secs: u64,
 }
 
 /// Configuration for a single upstream provider.
@@ -61,8 +96,21 @@ impl Default for RelayConfig {
             default_upstream: "https://api.openai.com".to_string(),
             routes: BTreeMap::new(),
             allowed_upstreams: Vec::new(),
+            max_request_bytes: default_max_request_bytes(),
+            release_artifact_digest: None,
+            secret_broker_url: None,
+            secret_broker_ca_sha256: None,
+            upstream_timeout_secs: default_upstream_timeout_secs(),
         }
     }
+}
+
+fn default_max_request_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_upstream_timeout_secs() -> u64 {
+    120
 }
 
 /// Extract the **origin** (scheme + host + port) from a URL string.
@@ -70,41 +118,68 @@ impl Default for RelayConfig {
 /// Returns `Some("scheme://host:port")` — the port is always explicit so that
 /// `https://example.com` and `https://example.com:8443` are distinct.
 fn url_origin(raw: &str) -> Option<String> {
-    // Minimal URL parsing: split on "://" then extract host:port.
-    let (scheme, rest) = raw.split_once("://")?;
-    let scheme = scheme.to_lowercase();
-    // `rest` is e.g. "api.openai.com/v1/chat" or "api.openai.com:443/v1".
-    // Strip path (and any userinfo — we reject `@` below).
-    let authority = rest.split('/').next().unwrap_or(rest);
-
-    // Reject userinfo like "user@host" which could be used to trick the check.
-    if authority.contains('@') {
+    let parsed = Url::parse(raw).ok()?;
+    let scheme = parsed.scheme();
+    if !matches!(scheme, "https" | "http") {
         return None;
     }
 
-    // Split host:port. If no port, infer default from scheme.
-    let (host, port) = if let Some((h, p)) = authority.rsplit_once(':') {
-        // Make sure the "port" is actually numeric (not an IPv6 bracket group).
-        if p.chars().all(|c| c.is_ascii_digit()) {
-            (h.to_string(), p.to_string())
-        } else {
-            // Probably an IPv6 address like [::1], treat whole thing as host.
-            (authority.to_string(), default_port(&scheme).to_string())
-        }
-    } else {
-        (authority.to_string(), default_port(&scheme).to_string())
-    };
+    // Reject userinfo like "user@host" which can trick humans reviewing allowlists.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
 
-    // Normalise host to lowercase.
-    Some(format!("{}://{}:{}", scheme, host.to_lowercase(), port))
+    let host = parsed.host_str()?.to_lowercase();
+    let port = parsed.port_or_known_default()?;
+
+    Some(format!("{scheme}://{host}:{port}"))
 }
 
-fn default_port(scheme: &str) -> u16 {
-    match scheme {
-        "https" => 443,
-        "http" => 80,
-        _ => 0,
+fn validate_release_artifact_digest(raw: &str) -> Result<(), String> {
+    let digest = raw.trim();
+    let hex = digest
+        .strip_prefix("sha256:")
+        .or_else(|| digest.strip_prefix("SHA256:"))
+        .unwrap_or(digest);
+
+    if hex.len() != 64 {
+        return Err(format!(
+            "release_artifact_digest must be a 32-byte sha256 hex digest, got {} hex chars",
+            hex.len()
+        ));
     }
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("release_artifact_digest must be hex".to_string());
+    }
+    Ok(())
+}
+
+fn validate_sha256_hex(label: &str, raw: &str) -> Result<(), String> {
+    let digest = raw.trim();
+    if digest.len() != 64 {
+        return Err(format!(
+            "{label} must be a 32-byte sha256 hex digest, got {} hex chars",
+            digest.len()
+        ));
+    }
+    if !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("{label} must be hex"));
+    }
+    Ok(())
+}
+
+fn validate_secret_broker_url(raw: &str) -> Result<(), String> {
+    let parsed = Url::parse(raw).map_err(|e| format!("secret_broker_url is invalid: {e}"))?;
+    if parsed.scheme() != "https" {
+        return Err("secret_broker_url must use https:// in attested configuration".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("secret_broker_url must not contain userinfo".to_string());
+    }
+    if parsed.host_str().is_none() {
+        return Err("secret_broker_url must include a host".to_string());
+    }
+    Ok(())
 }
 
 impl RelayConfig {
@@ -168,6 +243,16 @@ impl RelayConfig {
     /// Validate that all configured routes point to allowed upstreams.
     /// Call this at startup to catch misconfiguration early.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(digest) = &self.release_artifact_digest {
+            validate_release_artifact_digest(digest)?;
+        }
+        if let Some(url) = &self.secret_broker_url {
+            validate_secret_broker_url(url)?;
+        }
+        if let Some(digest) = &self.secret_broker_ca_sha256 {
+            validate_sha256_hex("secret_broker_ca_sha256", digest)?;
+        }
+
         if !self.allowed_upstreams.is_empty() {
             // Check default upstream.
             self.check_upstream_allowed(&self.default_upstream)
@@ -225,6 +310,32 @@ impl RelayConfig {
             hasher.update(b"\n");
         }
 
+        hasher.update(b"max_request_bytes:");
+        hasher.update(self.max_request_bytes.to_string().as_bytes());
+        hasher.update(b"\n");
+
+        if let Some(digest) = &self.release_artifact_digest {
+            hasher.update(b"release_artifact_digest:");
+            hasher.update(digest.trim().to_ascii_lowercase().as_bytes());
+            hasher.update(b"\n");
+        }
+
+        if let Some(url) = &self.secret_broker_url {
+            hasher.update(b"secret_broker_url:");
+            hasher.update(url.trim().as_bytes());
+            hasher.update(b"\n");
+        }
+
+        if let Some(digest) = &self.secret_broker_ca_sha256 {
+            hasher.update(b"secret_broker_ca_sha256:");
+            hasher.update(digest.trim().to_ascii_lowercase().as_bytes());
+            hasher.update(b"\n");
+        }
+
+        hasher.update(b"upstream_timeout_secs:");
+        hasher.update(self.upstream_timeout_secs.to_string().as_bytes());
+        hasher.update(b"\n");
+
         hasher.finalize().into()
     }
 }
@@ -270,8 +381,12 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(config.check_upstream_allowed("https://api.openai.com/v1/chat").is_ok());
-        assert!(config.check_upstream_allowed("https://api.openai.com").is_ok());
+        assert!(config
+            .check_upstream_allowed("https://api.openai.com/v1/chat")
+            .is_ok());
+        assert!(config
+            .check_upstream_allowed("https://api.openai.com")
+            .is_ok());
     }
 
     #[test]
@@ -283,7 +398,9 @@ mod tests {
 
         // Must be blocked — the real host is api.openai.com.evil.com
         assert!(
-            config.check_upstream_allowed("https://api.openai.com.evil.com/steal").is_err(),
+            config
+                .check_upstream_allowed("https://api.openai.com.evil.com/steal")
+                .is_err(),
             "subdomain impersonation must be blocked"
         );
     }
@@ -297,7 +414,9 @@ mod tests {
 
         // Must be blocked — the real host is evil.com (userinfo is ignored by browsers)
         assert!(
-            config.check_upstream_allowed("https://api.openai.com@evil.com/steal").is_err(),
+            config
+                .check_upstream_allowed("https://api.openai.com@evil.com/steal")
+                .is_err(),
             "userinfo-based bypass must be blocked"
         );
     }
@@ -309,13 +428,17 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(config.check_upstream_allowed("https://evil.com/steal").is_err());
+        assert!(config
+            .check_upstream_allowed("https://evil.com/steal")
+            .is_err());
     }
 
     #[test]
     fn empty_allowlist_permits_all() {
         let config = RelayConfig::default();
-        assert!(config.check_upstream_allowed("https://anything.com").is_ok());
+        assert!(config
+            .check_upstream_allowed("https://anything.com")
+            .is_ok());
     }
 
     // ── routing ─────────────────────────────────────────────────────────
@@ -453,6 +576,82 @@ mod tests {
             config_b.config_hash(),
             "config with path=None vs path=Some must differ"
         );
+    }
+
+    #[test]
+    fn config_hash_differs_when_release_artifact_digest_changes() {
+        let config_a = RelayConfig {
+            release_artifact_digest: Some(
+                "5610754eb95be37c666c5240287027cc1173c26d249a3deaade30f12cdbf8bfd".to_string(),
+            ),
+            ..Default::default()
+        };
+        let config_b = RelayConfig {
+            release_artifact_digest: Some(
+                "9743b9e2023398158544ee5b46d8173a08b020e1d19afd6acb13e7f548768bd5".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_ne!(
+            config_a.config_hash(),
+            config_b.config_hash(),
+            "artifact digest changes must alter the config hash bound into REPORTDATA"
+        );
+    }
+
+    #[test]
+    fn config_hash_differs_when_secret_broker_identity_changes() {
+        let config_a = RelayConfig {
+            secret_broker_url: Some("https://broker-a.internal:8787/v1/secret/provider".into()),
+            secret_broker_ca_sha256: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ),
+            ..Default::default()
+        };
+        let config_b = RelayConfig {
+            secret_broker_url: Some("https://broker-b.internal:8787/v1/secret/provider".into()),
+            secret_broker_ca_sha256: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            ),
+            ..Default::default()
+        };
+
+        assert_ne!(
+            config_a.config_hash(),
+            config_b.config_hash(),
+            "broker URL/CA changes must alter the config hash bound into REPORTDATA"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_release_artifact_digest() {
+        let config = RelayConfig {
+            release_artifact_digest: Some("not-a-digest".to_string()),
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_insecure_secret_broker_url() {
+        let config = RelayConfig {
+            secret_broker_url: Some("http://broker.internal:8787/v1/secret/provider".into()),
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_bad_secret_broker_ca_digest() {
+        let config = RelayConfig {
+            secret_broker_ca_sha256: Some("not-a-digest".to_string()),
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_err());
     }
 
     #[test]

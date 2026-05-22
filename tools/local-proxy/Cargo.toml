@@ -1,0 +1,47 @@
+[package]
+name = "trusted-relay-local"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+relay-attest = { path = "../../crates/relay-attest", default-features = false }
+relay-core = { path = "../../crates/relay-core" }
+relay-tls = { path = "../../crates/relay-tls" }
+anyhow.workspace = true
+axum = { version = "0.8", features = ["macros"] }
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+hex = "0.4"
+http-body-util = "0.1"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1", "http2"] }
+rustls = { workspace = true, features = ["ring"] }
+rustls-pki-types = "1"
+sha2.workspace = true
+tokio.workspace = true
+tokio-rustls = "0.26"
+tower = "0.5"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url = "2"
+
+[features]
+default = []
+mock = ["relay-attest/mock"]
+sev-snp = ["relay-attest/sev-snp"]
+gcp-confidential-space = ["relay-attest/gcp-confidential-space"]
+
+[dev-dependencies]
+base64 = "0.22"
+jsonwebtoken = "9"
+rand = "0.8"
+rsa.workspace = true
+axum = { version = "0.8", features = ["macros"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2", "service"] }
+relay-attest = { path = "../../crates/relay-attest", features = ["mock", "gcp-confidential-space"] }
+relay-core = { path = "../../crates/relay-core" }
+relay-tls = { path = "../../crates/relay-tls" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+serde_json.workspace = true
+tokio-rustls = "0.26"

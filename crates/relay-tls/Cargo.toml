@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-relay-attest = { path = "../relay-attest" }
+relay-attest = { path = "../relay-attest", default-features = false }
 rustls = { workspace = true, features = ["ring"] }
 rustls-pemfile = "2"
 rcgen = "0.13"
@@ -15,4 +15,8 @@ tokio.workspace = true
 tokio-rustls = "0.26"
 anyhow.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 webpki = { package = "rustls-webpki", version = "0.102" }
+
+[dev-dependencies]
+relay-attest = { path = "../relay-attest", features = ["mock"] }

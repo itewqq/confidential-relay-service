@@ -4,8 +4,13 @@ members = [
     "crates/relay-attest",
     "crates/relay-tls",
     "crates/relay-core",
+    "crates/relay-secret",
     "crates/relay-sdk",
     "server",
+    "tools/online-check",
+    "tools/secret-broker",
+    "tools/gateway",
+    "tools/local-proxy",
 ]
 
 [workspace.dependencies]
@@ -18,3 +23,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
 rustls = "0.23"
+zeroize = { version = "1", features = ["derive"] }
+rsa = "0.9.8"

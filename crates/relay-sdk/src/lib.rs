@@ -11,7 +11,7 @@
 //! # async fn example() -> anyhow::Result<()> {
 //! let client = TrustedRelayClient::builder()
 //!     .endpoint("https://relay.example.com:8443")
-//!     .api_key("provider-token-from-env")
+//!     .api_key(std::env::var("TRUSTED_RELAY_LOCAL_TOKEN")?)
 //!     .verification(VerificationPolicy::MockDev)
 //!     .build()?;
 //!

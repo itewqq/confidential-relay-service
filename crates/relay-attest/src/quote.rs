@@ -27,6 +27,7 @@ fn tee_type_to_byte(t: TeeType) -> u8 {
         TeeType::Mock => 0,
         TeeType::Tdx => 1,
         TeeType::SevSnp => 2,
+        TeeType::GcpConfidentialSpace => 3,
     }
 }
 
@@ -35,7 +36,10 @@ fn byte_to_tee_type(b: u8) -> Result<TeeType, AttestError> {
         0 => Ok(TeeType::Mock),
         1 => Ok(TeeType::Tdx),
         2 => Ok(TeeType::SevSnp),
-        _ => Err(AttestError::X509Error(format!("unknown TEE type byte: {b}"))),
+        3 => Ok(TeeType::GcpConfidentialSpace),
+        _ => Err(AttestError::X509Error(format!(
+            "unknown TEE type byte: {b}"
+        ))),
     }
 }
 
@@ -45,8 +49,8 @@ fn byte_to_tee_type(b: u8) -> Result<TeeType, AttestError> {
 /// The returned params can be used with [`CertificateParams::self_signed`] and a
 /// [`KeyPair`] to produce a DER-encoded certificate.
 pub fn cert_params_with_evidence(evidence: &Evidence) -> CertificateParams {
-    let mut params = CertificateParams::new(vec!["trusted-relay".to_string()])
-        .expect("valid cert params");
+    let mut params =
+        CertificateParams::new(vec!["trusted-relay".to_string()]).expect("valid cert params");
 
     params
         .distinguished_name
@@ -71,9 +75,7 @@ pub fn cert_params_with_evidence(evidence: &Evidence) -> CertificateParams {
 ///
 /// Returns `(cert_der, key_pair)` — the key pair's private key should be used to
 /// configure the TLS server.
-pub fn generate_attested_cert(
-    evidence: &Evidence,
-) -> Result<(Vec<u8>, KeyPair), AttestError> {
+pub fn generate_attested_cert(evidence: &Evidence) -> Result<(Vec<u8>, KeyPair), AttestError> {
     let key_pair =
         KeyPair::generate().map_err(|e| AttestError::X509Error(format!("keygen failed: {e}")))?;
 
@@ -110,13 +112,10 @@ pub fn extract_evidence_from_cert(cert_der: &[u8]) -> Result<Evidence, AttestErr
     let data = evidence_data.ok_or_else(|| {
         AttestError::X509Error("missing attestation evidence extension".to_string())
     })?;
-    let tt = tee_type
-        .ok_or_else(|| AttestError::X509Error("missing TEE type extension".to_string()))?;
+    let tt =
+        tee_type.ok_or_else(|| AttestError::X509Error("missing TEE type extension".to_string()))?;
 
-    Ok(Evidence {
-        tee_type: tt,
-        data,
-    })
+    Ok(Evidence { tee_type: tt, data })
 }
 
 /// Extract the SubjectPublicKeyInfo (SPKI) DER-encoded bytes from a certificate.
@@ -132,7 +131,7 @@ pub fn extract_spki_from_cert(cert_der: &[u8]) -> Result<Vec<u8>, AttestError> {
     Ok(cert.tbs_certificate.subject_pki.raw.to_vec())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "mock"))]
 mod tests {
     use super::*;
     use crate::mock::MockAttester;

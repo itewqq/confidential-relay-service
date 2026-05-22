@@ -1,0 +1,27 @@
+[package]
+name = "trusted-relay-online-check"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+relay-attest = { path = "../../crates/relay-attest", default-features = false }
+relay-core = { path = "../../crates/relay-core" }
+relay-tls = { path = "../../crates/relay-tls" }
+anyhow.workspace = true
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+rustls = { workspace = true, features = ["ring"] }
+rustls-pki-types = "1"
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-rustls = "0.26"
+tracing-subscriber.workspace = true
+url = "2"
+x509-parser = "0.16"
+
+[features]
+default = ["sev-snp"]
+sev-snp = ["relay-attest/sev-snp"]
+gcp-confidential-space = ["relay-attest/gcp-confidential-space"]

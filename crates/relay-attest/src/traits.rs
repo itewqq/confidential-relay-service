@@ -8,6 +8,11 @@ use crate::types::{AttestError, Evidence};
 /// specific TLS channel.
 pub trait Attester: Send + Sync {
     fn attest(&self, user_data: &[u8; 64]) -> Result<Evidence, AttestError>;
+
+    /// Human-readable backend name for logs and diagnostics.
+    fn name(&self) -> &'static str {
+        "unknown"
+    }
 }
 
 /// Verifies attestation evidence on the client side.

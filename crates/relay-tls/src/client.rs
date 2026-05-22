@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use relay_attest::quote::{extract_evidence_from_cert, extract_spki_from_cert};
-use relay_attest::Verifier;
+use relay_attest::{TeeType, Verifier};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::verify_tls12_signature as crypto_verify_tls12;
 use rustls::crypto::verify_tls13_signature as crypto_verify_tls13;
@@ -20,8 +20,9 @@ use sha2::{Digest, Sha384};
 /// 3. Computes `expected_reportdata`:
 ///    - Bytes 0..48: `SHA-384(SPKI)`
 ///    - Bytes 48..64: `config_hash[0..16]` (if provided), else zeros
-/// 4. Calls `Verifier::verify(evidence, expected_measurement)` to check the
-///    hardware signature and measurement
+/// 4. Calls `Verifier::verify(...)` to check the hardware/cloud signature and
+///    pinned workload identity. For Confidential Space, the verifier input is
+///    the expected nonce/reportdata only when a config hash is pinned.
 /// 5. Confirms the REPORTDATA in the evidence matches the expected value
 ///    (proving the TLS key lives inside the attested TEE and the config is as expected)
 pub struct AttestedCertVerifier {
@@ -37,7 +38,10 @@ impl std::fmt::Debug for AttestedCertVerifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AttestedCertVerifier")
             .field("expected_measurement", &self.expected_measurement)
-            .field("expected_config_hash", &self.expected_config_hash.map(hex::encode))
+            .field(
+                "expected_config_hash",
+                &self.expected_config_hash.map(hex::encode),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -64,7 +68,6 @@ impl AttestedCertVerifier {
         }
     }
 }
-
 
 impl ServerCertVerifier for AttestedCertVerifier {
     fn verify_server_cert(
@@ -98,10 +101,24 @@ impl ServerCertVerifier for AttestedCertVerifier {
             expected_reportdata[48..64].copy_from_slice(&ch[..16]);
         }
 
-        // 4. Verify the attestation evidence (signature chain + measurement).
+        // 4. Verify the attestation evidence. Different backends interpret the
+        //    optional verifier input differently:
+        //    - SEV-SNP/TDX/mock: expected launch measurement.
+        //    - Confidential Space: expected token nonce/reportdata.
+        //
+        //    In GCP audit mode there may be no pinned config hash, so do not
+        //    pass a zeroed config nonce; the generic checks below still bind
+        //    the returned nonce to this TLS key.
+        let expected_attested_data = match evidence.tee_type {
+            TeeType::GcpConfidentialSpace if self.expected_config_hash.is_some() => {
+                Some(&expected_reportdata[..])
+            }
+            TeeType::GcpConfidentialSpace => None,
+            _ => self.expected_measurement.as_deref(),
+        };
         let actual_reportdata = self
             .verifier
-            .verify(&evidence, self.expected_measurement.as_deref())
+            .verify(&evidence, expected_attested_data)
             .map_err(|e| TlsError::General(format!("attestation verification failed: {e}")))?;
 
         // 5. Confirm REPORTDATA bytes 0..48 match — proves the TLS key is inside the TEE.
@@ -296,7 +313,10 @@ mod tests {
             UnixTime::now(),
         );
 
-        assert!(result.is_ok(), "should accept matching config hash: {result:?}");
+        assert!(
+            result.is_ok(),
+            "should accept matching config hash: {result:?}"
+        );
     }
 
     #[test]
@@ -366,6 +386,9 @@ mod tests {
             UnixTime::now(),
         );
 
-        assert!(result.is_ok(), "should accept when no config hash expected: {result:?}");
+        assert!(
+            result.is_ok(),
+            "should accept when no config hash expected: {result:?}"
+        );
     }
 }

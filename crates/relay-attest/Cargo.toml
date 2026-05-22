@@ -23,9 +23,21 @@ libc = { version = "0.2", optional = true }
 p384 = { version = "0.13", features = ["ecdsa"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
 tokio = { workspace = true, optional = true }
+webpki = { package = "rustls-webpki", version = "0.103", features = ["ring"], optional = true }
+rustls-pki-types = { version = "1", optional = true }
+asn1-rs = { version = "0.6", optional = true }
+ring = { version = "0.17", optional = true }
+oid-registry = { version = "0.7", features = ["crypto"], optional = true }
+base64 = { version = "0.22", optional = true }
+jsonwebtoken = { version = "9", optional = true }
+url = { version = "2", optional = true }
+
+[dev-dependencies]
+rsa.workspace = true
 
 [features]
-default = ["mock"]
+default = []
 mock = []
 tdx = ["libc"]
-sev-snp = ["libc", "p384", "reqwest", "tokio"]
+sev-snp = ["libc", "p384", "reqwest", "tokio", "webpki", "rustls-pki-types", "asn1-rs", "ring", "oid-registry"]
+gcp-confidential-space = ["base64", "jsonwebtoken", "reqwest", "tokio", "url"]

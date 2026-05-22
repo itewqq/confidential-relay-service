@@ -8,6 +8,8 @@ pub enum TeeType {
     Tdx,
     /// AMD SEV-SNP (Secure Encrypted Virtualization - Secure Nested Paging)
     SevSnp,
+    /// Google Cloud Confidential Space attestation token.
+    GcpConfidentialSpace,
     /// Mock TEE for development and testing
     Mock,
 }

@@ -21,8 +21,9 @@ use rcgen::KeyPair;
 use relay_attest::quote;
 use relay_attest::types::AttestError;
 use relay_attest::Attester;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha384};
+use zeroize::Zeroize;
 
 /// Holds the TLS server configuration backed by an attested certificate.
 pub struct AttestedTlsServer {
@@ -50,42 +51,59 @@ impl AttestedTlsServer {
     /// can verify it from the REPORTDATA in the attestation quote.
     ///
     /// Pass `None` during development (bytes 48..64 will be zero).
-    pub fn new(attester: &dyn Attester, config_hash: Option<&[u8; 32]>) -> Result<Self, AttestError> {
-        // Step 1: generate key pair.
+    pub fn new(
+        attester: &dyn Attester,
+        config_hash: Option<&[u8; 32]>,
+    ) -> Result<Self, AttestError> {
         let key_pair = KeyPair::generate()
             .map_err(|e| AttestError::GenerationFailed(format!("keygen: {e}")))?;
+        Self::from_key_pair(attester, config_hash, key_pair)
+    }
 
-        // Step 2: compute REPORTDATA.
-        // Bytes 0..48  = SHA-384(public_key_der)  — TLS key binding
-        // Bytes 48..64 = config_hash[0..16]        — config binding
+    /// Create an attested TLS server from an existing key pair. This is used
+    /// by tests and by callers that need to sign the same certificate again.
+    pub fn from_key_pair(
+        attester: &dyn Attester,
+        config_hash: Option<&[u8; 32]>,
+        key_pair: KeyPair,
+    ) -> Result<Self, AttestError> {
         let pubkey_der = key_pair.public_key_der();
         let hash = Sha384::digest(&pubkey_der);
         let mut reportdata = [0u8; 64];
         reportdata[..48].copy_from_slice(&hash);
-
         if let Some(ch) = config_hash {
             reportdata[48..64].copy_from_slice(&ch[..16]);
         }
 
-        // Step 3: generate attestation evidence binding the public key + config.
         let evidence = attester.attest(&reportdata)?;
-
-        // Step 4: embed evidence in self-signed cert.
         let params = quote::cert_params_with_evidence(&evidence);
         let cert = params
             .self_signed(&key_pair)
             .map_err(|e| AttestError::X509Error(format!("self-sign: {e}")))?;
-        let cert_der = cert.der().to_vec();
+        Self::from_cert_key_pair(cert.der().to_vec(), key_pair)
+    }
 
-        // Step 5: build rustls ServerConfig.
-        let private_key_der =
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+    /// Create a server from a DER certificate and matching rcgen key pair.
+    pub fn from_cert_key_pair(cert_der: Vec<u8>, key_pair: KeyPair) -> Result<Self, AttestError> {
+        let mut private_key_bytes = key_pair.serialize_der();
+        let private_key_der = PrivateKeyDer::try_from(private_key_bytes.clone())
+            .map_err(|e| AttestError::X509Error(format!("private key DER: {e}")))?;
+        private_key_bytes.zeroize();
+        Self::from_cert_der_and_key(cert_der, private_key_der)
+    }
+
+    /// Create a server from caller-provided DER certificate and private key.
+    pub fn from_cert_der_and_key(
+        cert_der: Vec<u8>,
+        private_key_der: PrivateKeyDer<'static>,
+    ) -> Result<Self, AttestError> {
         let cert_chain = vec![CertificateDer::from(cert_der.clone())];
 
-        let server_config = rustls::ServerConfig::builder()
+        let mut server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(cert_chain, private_key_der)
             .map_err(|e| AttestError::Other(anyhow::anyhow!("rustls config: {e}")))?;
+        server_config.send_tls13_tickets = 0;
 
         Ok(Self {
             server_config: Arc::new(server_config),
@@ -129,8 +147,7 @@ mod tests {
         let attester = MockAttester;
         let server = AttestedTlsServer::new(&attester, None).unwrap();
 
-        let evidence =
-            relay_attest::quote::extract_evidence_from_cert(server.cert_der()).unwrap();
+        let evidence = relay_attest::quote::extract_evidence_from_cert(server.cert_der()).unwrap();
         assert_eq!(evidence.tee_type, relay_attest::TeeType::Mock);
     }
 
@@ -142,8 +159,7 @@ mod tests {
         let server = AttestedTlsServer::new(&attester, Some(&config_hash)).unwrap();
 
         // Extract evidence and verify REPORTDATA bytes 48..64 match config_hash[0..16].
-        let evidence =
-            relay_attest::quote::extract_evidence_from_cert(server.cert_der()).unwrap();
+        let evidence = relay_attest::quote::extract_evidence_from_cert(server.cert_der()).unwrap();
         let verifier = relay_attest::mock::MockVerifier;
         use relay_attest::Verifier;
         let reportdata = verifier.verify(&evidence, None).unwrap();

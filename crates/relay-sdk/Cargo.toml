@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-relay-attest = { path = "../relay-attest" }
+relay-attest = { path = "../relay-attest", default-features = false }
 relay-tls = { path = "../relay-tls" }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-manual-roots", "json"] }
 rustls.workspace = true
@@ -17,6 +17,7 @@ futures-util = "0.3"
 bytes = "1"
 
 [features]
-default = ["mock"]
+default = []
 mock = ["relay-attest/mock"]
 sev-snp = ["relay-attest/sev-snp"]
+gcp-confidential-space = ["relay-attest/gcp-confidential-space"]

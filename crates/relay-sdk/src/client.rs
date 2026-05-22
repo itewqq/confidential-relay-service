@@ -93,6 +93,35 @@ impl TrustedRelayClientBuilder {
     /// - `MockDev` is used without the `mock` feature.
     pub fn build(self) -> anyhow::Result<TrustedRelayClient> {
         let verifier: Arc<dyn Verifier> = match &self.policy {
+            VerificationPolicy::GcpConfidentialSpace {
+                audience,
+                image_digest,
+            } => {
+                #[cfg(not(feature = "gcp-confidential-space"))]
+                let _ = (audience, image_digest);
+                if let Some(v) = self.explicit_verifier {
+                    v
+                } else {
+                    #[cfg(feature = "gcp-confidential-space")]
+                    {
+                        let policy = relay_attest::gcp_confidential_space::GcpConfidentialSpacePolicy::strict_for_image(
+                            audience.clone(),
+                            image_digest.clone(),
+                        );
+                        Arc::new(
+                            relay_attest::gcp_confidential_space::GcpConfidentialSpaceVerifier::new(
+                                policy,
+                            )?,
+                        )
+                    }
+                    #[cfg(not(feature = "gcp-confidential-space"))]
+                    {
+                        anyhow::bail!(
+                            "GcpConfidentialSpace policy requires the gcp-confidential-space feature or an explicit verifier"
+                        );
+                    }
+                }
+            }
             VerificationPolicy::MockDev => {
                 // MockDev: only use mock verifier, only if explicitly enabled.
                 if self.explicit_verifier.is_some() {
@@ -112,6 +141,13 @@ impl TrustedRelayClientBuilder {
             // Production policies: Strict, Audit, TrustOnFirstUse.
             // These MUST use a real verifier — never fall back to mock.
             _production_policy => {
+                if matches!(self.policy, VerificationPolicy::TrustOnFirstUse) {
+                    anyhow::bail!(
+                        "VerificationPolicy::TrustOnFirstUse is not implemented yet. \
+                         Use Strict with an expected measurement, Audit, or MockDev."
+                    );
+                }
+
                 if let Some(v) = self.explicit_verifier {
                     // User provided an explicit verifier — use it.
                     v
@@ -123,28 +159,33 @@ impl TrustedRelayClientBuilder {
                         tracing::info!("auto-selected SEV-SNP verifier for production policy");
                         Arc::new(relay_attest::sev_snp::SevSnpVerifier)
                     }
-                    #[cfg(all(not(feature = "sev-snp"), feature = "mock"))]
+                    #[cfg(not(feature = "sev-snp"))]
                     {
-                        // Fail closed: mock feature is enabled but we refuse to use it
-                        // for production policies.
+                        // There is no safe generic default for Audit/Strict on
+                        // Confidential Space because it needs an image policy.
                         anyhow::bail!(
-                            "production verification policy ({:?}) requires a real TEE verifier. \
-                             Either provide one via .verifier(), enable the 'sev-snp' feature, \
-                             or use VerificationPolicy::MockDev for development.",
-                            self.policy
-                        );
-                    }
-                    #[cfg(all(not(feature = "sev-snp"), not(feature = "mock")))]
-                    {
-                        anyhow::bail!(
-                            "no TEE verifier available for production policy ({:?}). \
-                             Enable the 'sev-snp' feature or provide a verifier via .verifier().",
+                            "production verification policy ({:?}) requires a concrete verifier.                              Enable 'sev-snp', provide one via .verifier(), or use                              VerificationPolicy::GcpConfidentialSpace with an image digest.",
                             self.policy
                         );
                     }
                 }
             }
         };
+
+        if matches!(
+            self.policy,
+            VerificationPolicy::Strict { .. } | VerificationPolicy::GcpConfidentialSpace { .. }
+        ) && self.expected_config_hash.is_none()
+        {
+            anyhow::bail!(
+                "Strict/GCP Confidential Space verification requires expected_config_hash() so the client pins \
+                 the relay's upstream routing configuration as well as its workload identity."
+            );
+        }
+
+        if self.endpoint.trim().is_empty() {
+            anyhow::bail!("relay endpoint must not be empty");
+        }
 
         let expected_measurement = self.policy.expected_measurement().map(|m| m.to_vec());
         let tls_config =
@@ -175,10 +216,7 @@ impl TrustedRelayClient {
     }
 
     /// Send a chat completion request through the attested relay.
-    pub async fn chat_completions(
-        &self,
-        request: ChatRequest,
-    ) -> anyhow::Result<ChatResponse> {
+    pub async fn chat_completions(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         let url = format!(
             "{}/v1/chat/completions",
             self.endpoint.trim_end_matches('/')

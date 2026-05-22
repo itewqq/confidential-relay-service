@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 760" role="img" aria-labelledby="title desc">
+  <title id="title">Trusted Relay architecture and trust boundaries</title>
+  <desc id="desc">A local app talks to a user-side proxy, which verifies Confidential Space attestation before sending encrypted traffic through a blind gateway to a private Confidential VM relay. A secret broker releases the provider key only after attestation succeeds. The upstream provider sees plaintext.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8f4e8"/>
+      <stop offset="0.55" stop-color="#eef4ea"/>
+      <stop offset="1" stop-color="#e8f0f7"/>
+    </linearGradient>
+    <linearGradient id="secure" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#113c3a"/>
+      <stop offset="1" stop-color="#1d6b5d"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5f3b16"/>
+      <stop offset="1" stop-color="#a75f20"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-15%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="12" stdDeviation="12" flood-color="#15302d" flood-opacity="0.16"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#173b3a"/>
+    </marker>
+    <marker id="arrowSoft" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#8b4a1a"/>
+    </marker>
+    <style>
+      .title{font:700 36px Georgia,serif;fill:#152b2a}
+      .subtitle{font:16px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#47615f}
+      .label{font:700 20px Georgia,serif;fill:#173331}
+      .small{font:14px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#35524f}
+      .tiny{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#4c6461}
+      .whiteLabel{font:700 20px Georgia,serif;fill:#fffaf0}
+      .whiteSmall{font:14px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#e8fff5}
+      .box{fill:#fffdf6;stroke:#1e4a46;stroke-width:2;rx:22;filter:url(#shadow)}
+      .secureBox{fill:url(#secure);stroke:#d9f4df;stroke-width:2;rx:24;filter:url(#shadow)}
+      .edgeBox{fill:#fff7ea;stroke:#a75f20;stroke-width:2;rx:22;filter:url(#shadow)}
+      .brokerBox{fill:#fbfbff;stroke:#425aa8;stroke-width:2;rx:22;filter:url(#shadow)}
+      .trust{fill:none;stroke:#1d6b5d;stroke-width:3;stroke-dasharray:9 8;rx:28}
+      .notTrust{fill:none;stroke:#a75f20;stroke-width:3;stroke-dasharray:4 8;rx:28}
+      .line{fill:none;stroke:#173b3a;stroke-width:3;marker-end:url(#arrow)}
+      .softLine{fill:none;stroke:#8b4a1a;stroke-width:3;marker-end:url(#arrowSoft)}
+      .dashLine{fill:none;stroke:#425aa8;stroke-width:3;stroke-dasharray:8 8;marker-end:url(#arrow)}
+      .badge{fill:#fff0c2;stroke:#bd7a1f;stroke-width:1.5;rx:15}
+      .ok{fill:#d9f4df;stroke:#1d6b5d;stroke-width:1.5;rx:13}
+      .no{fill:#ffe2d4;stroke:#a74420;stroke-width:1.5;rx:13}
+    </style>
+  </defs>
+
+  <rect width="1320" height="760" fill="url(#bg)"/>
+  <circle cx="1160" cy="92" r="120" fill="#fff6d5" opacity="0.52"/>
+  <circle cx="110" cy="670" r="180" fill="#cfebe1" opacity="0.45"/>
+
+  <text x="56" y="62" class="title">Trusted Relay</text>
+  <text x="58" y="92" class="subtitle">Verifiable relay: local attested TLS -> private CVM -> upstream provider</text>
+
+  <rect x="40" y="130" width="280" height="230" class="box"/>
+  <text x="72" y="175" class="label">User Machine</text>
+  <text x="72" y="210" class="small">App / SDK / CLI</text>
+  <text x="72" y="238" class="small">127.0.0.1 local proxy</text>
+  <rect x="72" y="265" width="200" height="48" class="ok"/>
+  <text x="88" y="295" class="tiny">pins image digest + config hash</text>
+  <text x="72" y="335" class="tiny">Strips local Authorization before CVM</text>
+
+  <rect x="395" y="130" width="250" height="230" class="edgeBox"/>
+  <text x="430" y="175" class="label">Blind Gateway</text>
+  <text x="430" y="210" class="small">HTTP CONNECT only</text>
+  <text x="430" y="238" class="small">User auth / quota lives here</text>
+  <rect x="430" y="265" width="165" height="48" class="no"/>
+  <text x="446" y="295" class="tiny">cannot decrypt prompts</text>
+  <text x="430" y="335" class="tiny">Sees IPs, timing, byte counts</text>
+
+  <rect x="720" y="110" width="315" height="270" class="secureBox"/>
+  <text x="758" y="158" class="whiteLabel">Private Confidential VM</text>
+  <text x="758" y="194" class="whiteSmall">trusted-relay-server</text>
+  <text x="758" y="224" class="whiteSmall">GCP Confidential Space</text>
+  <text x="758" y="254" class="whiteSmall">attested TLS terminates here</text>
+  <rect x="758" y="282" width="225" height="48" class="ok"/>
+  <text x="774" y="312" class="tiny">no public IP; provider key injected</text>
+  <text x="758" y="356" class="tiny" fill="#dffcf2">Only audited code should see plaintext</text>
+
+  <rect x="1100" y="130" width="180" height="230" class="box"/>
+  <text x="1134" y="175" class="label">Provider</text>
+  <text x="1134" y="210" class="small">OpenAI /</text>
+  <text x="1134" y="238" class="small">Anthropic /</text>
+  <text x="1134" y="266" class="small">your API</text>
+  <rect x="1134" y="293" width="112" height="42" class="badge"/>
+  <text x="1151" y="319" class="tiny">sees plaintext</text>
+
+  <path d="M320 240 C352 240 362 240 395 240" class="line"/>
+  <text x="332" y="224" class="tiny">attested TLS bytes</text>
+  <path d="M645 240 C682 240 692 240 720 240" class="line"/>
+  <text x="658" y="224" class="tiny">opaque TCP</text>
+  <path d="M1035 240 C1063 240 1072 240 1100 240" class="softLine"/>
+  <text x="1044" y="224" class="tiny">provider TLS</text>
+
+  <rect x="185" y="500" width="370" height="165" class="brokerBox"/>
+  <text x="225" y="548" class="label">Secret Broker</text>
+  <text x="225" y="582" class="small">verifies cert evidence + nonce</text>
+  <text x="225" y="610" class="small">pins image digest + config hash</text>
+  <text x="225" y="638" class="small">releases provider key once</text>
+
+  <path d="M725 360 C615 430 545 495 500 540" class="dashLine"/>
+  <text x="552" y="456" class="tiny">attested cert + one-time nonce</text>
+  <path d="M555 560 C650 510 718 438 775 370" class="dashLine"/>
+  <text x="606" y="536" class="tiny">provider credential after verification</text>
+
+  <rect x="735" y="500" width="515" height="165" class="box"/>
+  <text x="772" y="548" class="label">What Is Proven</text>
+  <text x="772" y="582" class="small">1. Google-signed CS token says this image digest ran</text>
+  <text x="772" y="610" class="small">2. eat_nonce binds TLS SPKI + RelayConfig hash</text>
+  <text x="772" y="638" class="small">3. changed trusted code -> changed digest -> reject</text>
+
+  <rect x="45" y="405" width="605" height="58" class="notTrust"/>
+  <text x="68" y="441" class="tiny">Outside prompt-confidentiality boundary: user auth, billing, gateway routing, traffic metadata</text>
+  <rect x="705" y="405" width="575" height="58" class="trust"/>
+  <text x="728" y="441" class="tiny">Prompt-confidentiality boundary: attested TLS endpoint + reviewed relay image/config</text>
+</svg>

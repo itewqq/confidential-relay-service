@@ -12,6 +12,7 @@ use relay_attest::Verifier;
 use relay_core::config::RelayConfig;
 use relay_core::proxy::AppState;
 use relay_core::router::build_router;
+use relay_core::secrets::{ProviderCredential, ProviderCredentialStore};
 use relay_sdk::client::TrustedRelayClient;
 use relay_sdk::types::ChatRequest;
 use relay_sdk::verify::VerificationPolicy;
@@ -21,14 +22,35 @@ use tokio_rustls::TlsAcceptor;
 
 /// Start a mock upstream server that returns a fake OpenAI response.
 async fn start_mock_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    start_mock_upstream_with_auth_check(None).await
+}
+
+async fn start_mock_upstream_with_auth_check(
+    expected_auth: Option<&'static str>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use axum::extract::State;
+    use axum::http::HeaderMap;
     use axum::routing::post;
     use axum::Json;
 
+    #[derive(Clone)]
+    struct UpstreamState {
+        expected_auth: Option<&'static str>,
+    }
+
     async fn fake_chat_completions(
+        State(state): State<UpstreamState>,
+        headers: HeaderMap,
         body: axum::body::Bytes,
     ) -> Json<serde_json::Value> {
         // Parse incoming to verify it's valid JSON.
         let _: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if let Some(expected) = state.expected_auth {
+            assert_eq!(
+                headers.get("authorization").and_then(|v| v.to_str().ok()),
+                Some(expected)
+            );
+        }
 
         Json(serde_json::json!({
             "id": "chatcmpl-test123",
@@ -51,7 +73,9 @@ async fn start_mock_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         }))
     }
 
-    let app = axum::Router::new().route("/v1/chat/completions", post(fake_chat_completions));
+    let app = axum::Router::new()
+        .route("/v1/chat/completions", post(fake_chat_completions))
+        .with_state(UpstreamState { expected_auth });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -66,24 +90,37 @@ async fn start_mock_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 /// Start the relay server with mock attestation on a random port.
 async fn start_relay_server(
     upstream_addr: SocketAddr,
-) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+    start_relay_server_with_credentials(upstream_addr, None).await
+}
+
+async fn start_relay_server_with_credentials(
+    upstream_addr: SocketAddr,
+    provider_credential: Option<ProviderCredential>,
+) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     // Install crypto provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let attester = MockAttester;
-    let tls_server = AttestedTlsServer::new(&attester, None).unwrap();
-    let tls_acceptor = TlsAcceptor::from(tls_server.server_config());
 
     let config = Arc::new(RelayConfig {
         listen_addr: "127.0.0.1:0".to_string(),
         default_upstream: format!("http://{}", upstream_addr),
         ..Default::default()
     });
+    let config_hash = config.config_hash();
+
+    let attester = MockAttester;
+    let tls_server = AttestedTlsServer::new(&attester, Some(&config_hash)).unwrap();
+    let tls_acceptor = TlsAcceptor::from(tls_server.server_config());
 
     let http_client = reqwest::Client::new();
+    let provider_credentials = ProviderCredentialStore::new();
+    if let Some(provider_credential) = provider_credential {
+        provider_credentials.set(provider_credential).await;
+    }
     let state = AppState {
         config,
         http_client,
+        provider_credentials,
     };
     let app = build_router(state);
 
@@ -114,7 +151,7 @@ async fn start_relay_server(
         }
     });
 
-    (addr, handle)
+    (addr, config_hash, handle)
 }
 
 #[tokio::test]
@@ -123,7 +160,7 @@ async fn e2e_mock_attestation_proxy() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
 
     // 2. Start relay server with mock attestation.
-    let (relay_addr, _relay_handle) = start_relay_server(upstream_addr).await;
+    let (relay_addr, _config_hash, _relay_handle) = start_relay_server(upstream_addr).await;
 
     // Give servers a moment to bind.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -158,7 +195,7 @@ async fn e2e_wrong_measurement_rejected() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
 
     // 2. Start relay server.
-    let (relay_addr, _relay_handle) = start_relay_server(upstream_addr).await;
+    let (relay_addr, config_hash, _relay_handle) = start_relay_server(upstream_addr).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 3. Create SDK client with WRONG expected measurement.
@@ -170,6 +207,7 @@ async fn e2e_wrong_measurement_rejected() {
         .verification(VerificationPolicy::Strict {
             expected_measurement: vec![0xFF; 32], // wrong!
         })
+        .expected_config_hash(config_hash)
         .build()
         .unwrap();
 
@@ -190,7 +228,7 @@ async fn e2e_correct_measurement_accepted() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
 
     // 2. Start relay server.
-    let (relay_addr, _relay_handle) = start_relay_server(upstream_addr).await;
+    let (relay_addr, config_hash, _relay_handle) = start_relay_server(upstream_addr).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 3. Create SDK client with CORRECT expected measurement.
@@ -203,6 +241,7 @@ async fn e2e_correct_measurement_accepted() {
         .verification(VerificationPolicy::Strict {
             expected_measurement: measurement.to_vec(),
         })
+        .expected_config_hash(config_hash)
         .build()
         .unwrap();
 
@@ -212,5 +251,42 @@ async fn e2e_correct_measurement_accepted() {
         .await
         .unwrap();
 
-    assert_eq!(response.choices[0].message.content, "Hello from the mock upstream!");
+    assert_eq!(
+        response.choices[0].message.content,
+        "Hello from the mock upstream!"
+    );
+}
+
+#[tokio::test]
+async fn e2e_injected_provider_credential_overrides_client_authorization() {
+    // 1. Start mock upstream that requires the injected provider credential.
+    let (upstream_addr, _upstream_handle) =
+        start_mock_upstream_with_auth_check(Some("Bearer provider-secret")).await;
+
+    // 2. Start relay with provider credential already injected into its runtime store.
+    let credential = ProviderCredential {
+        auth_scheme: "Bearer".to_string(),
+        token: "provider-secret".to_string(),
+    };
+    let (relay_addr, _config_hash, _relay_handle) =
+        start_relay_server_with_credentials(upstream_addr, Some(credential)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 3. Client sends a different local token; upstream must still see provider-secret.
+    let client = TrustedRelayClient::builder()
+        .endpoint(format!("https://127.0.0.1:{}", relay_addr.port()))
+        .api_key("local-user-token-not-provider-key")
+        .verification(VerificationPolicy::MockDev)
+        .build()
+        .unwrap();
+
+    let response = client
+        .chat_completions(ChatRequest::simple("gpt-4", "Hello"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.choices[0].message.content,
+        "Hello from the mock upstream!"
+    );
 }

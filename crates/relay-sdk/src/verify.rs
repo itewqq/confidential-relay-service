@@ -19,6 +19,12 @@ pub enum VerificationPolicy {
     /// check the specific measurement.  Trusts the operator's code.
     Audit,
 
+    /// GCP Confidential Space: pin a workload container digest/signature policy.
+    GcpConfidentialSpace {
+        audience: String,
+        image_digest: String,
+    },
+
     /// Mock: accept mock attestation evidence.  For development only.
     MockDev,
 }

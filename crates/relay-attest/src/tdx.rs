@@ -11,6 +11,10 @@ use crate::types::{AttestError, Evidence};
 pub struct TdxAttester;
 
 impl Attester for TdxAttester {
+    fn name(&self) -> &'static str {
+        "Intel TDX"
+    }
+
     fn attest(&self, _user_data: &[u8; 64]) -> Result<Evidence, AttestError> {
         // In a real implementation:
         // 1. Open /dev/tdx_guest

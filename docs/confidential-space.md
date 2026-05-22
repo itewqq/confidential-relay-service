@@ -1,0 +1,123 @@
+# Google Cloud Confidential Space Deployment
+
+Confidential Space is the chosen GCP production path for Trusted Relay. The
+release identity is the Google-signed workload-container claim
+`submods.container.image_digest` or `submods.container.image_signatures`, not raw
+GCP SEV-SNP `MEASUREMENT`.
+
+## Attestation Binding
+
+The relay asks the Confidential Space launcher for an OIDC token whose custom
+nonces encode the attested TLS binding:
+
+```text
+nonce/reportdata[0..48]  = SHA-384(TLS certificate SPKI)[0..48]
+nonce/reportdata[48..64] = RelayConfig::config_hash()[0..16]
+```
+
+Because the launcher limits nonce size, this is sent as two nonce strings:
+
+```text
+trr1s.<base64url(reportdata[0..48])>
+trr1c.<base64url(reportdata[48..64])>
+```
+
+The verifier checks:
+
+- Google OIDC signature and `iss`/`aud`/`exp`/`nbf`.
+- `eat_nonce` equals the expected TLS SPKI/config binding.
+- `swname == CONFIDENTIAL_SPACE`.
+- `dbgstat == disabled-since-boot`.
+- `secboot == true`.
+- Optional service account, project ID, zone, and instance name pins.
+- Container image digest and/or allowed image signature key ID.
+
+## Build And Push
+
+```bash
+tools/gcp/build-confidential-space-image.sh \
+  --project "$GCP_PROJECT" \
+  --region "$GCP_REGION" \
+  --repo trusted-relay
+```
+
+Record the printed `image_ref_with_digest` and `image_digest`.
+
+## Launch Private VM
+
+```bash
+tools/gcp/launch-confidential-space.sh \
+  --project "$GCP_PROJECT" \
+  --zone "$GCP_ZONE" \
+  --name trusted-relay-cs \
+  --image-ref "$IMAGE_REF_WITH_DIGEST" \
+  --env TRUSTED_RELAY_UPSTREAM="$TRUSTED_RELAY_UPSTREAM" \
+  --env TRUSTED_RELAY_ALLOWED_UPSTREAM="$TRUSTED_RELAY_ALLOWED_UPSTREAM" \
+  --env TRUSTED_RELAY_RELEASE_ARTIFACT_DIGEST="${IMAGE_DIGEST#sha256:}" \
+  --env TRUSTED_RELAY_SECRET_BROKER_URL="$TRUSTED_RELAY_SECRET_BROKER_URL" \
+  --env TRUSTED_RELAY_SECRET_BROKER_CA_PEM="$TRUSTED_RELAY_SECRET_BROKER_CA_PEM" \
+  --env TRUSTED_RELAY_SECRET_NONCE="$(uuidgen)" \
+  --duration 2h
+```
+
+Do not pass provider keys through metadata. The image allowlists only non-secret
+runtime configuration. Provider keys come from the secret broker after the relay
+has generated its attested TLS certificate.
+
+## Online Verification
+
+Audit mode prints claims without enforcing image identity:
+
+```bash
+cargo run -p trusted-relay-online-check --no-default-features \
+  --features gcp-confidential-space -- \
+  --backend gcp-confidential-space \
+  --endpoint https://RELAY_PRIVATE_IP:8443 \
+  --mode audit \
+  --print-only
+```
+
+Strict mode enforces image/config pins:
+
+```bash
+cargo run -p trusted-relay-online-check --no-default-features \
+  --features gcp-confidential-space -- \
+  --backend gcp-confidential-space \
+  --endpoint https://RELAY_PRIVATE_IP:8443 \
+  --mode strict \
+  --gcp-cs-image-digest "$IMAGE_DIGEST" \
+  --gcp-cs-service-account "$TRUSTED_RELAY_GCP_CS_SERVICE_ACCOUNT" \
+  --gcp-cs-project-id "$GCP_PROJECT" \
+  --gcp-cs-zone "$GCP_ZONE" \
+  --expected-config-hash "$TRUSTED_RELAY_EXPECTED_CONFIG_HASH" \
+  --health
+```
+
+The local proxy and broker use the same policy:
+
+```bash
+trusted-relay-local \
+  --backend gcp-confidential-space \
+  --relay-endpoint https://RELAY_PRIVATE_IP:8443 \
+  --gateway-addr GATEWAY_PUBLIC_IP:443 \
+  --expected-config-hash "$TRUSTED_RELAY_EXPECTED_CONFIG_HASH" \
+  --gcp-cs-image-digest "$IMAGE_DIGEST"
+
+trusted-relay-secret-broker \
+  --backend gcp-confidential-space \
+  --expected-config-hash "$TRUSTED_RELAY_EXPECTED_CONFIG_HASH" \
+  --gcp-cs-image-digest "$IMAGE_DIGEST" \
+  --gcp-cs-service-account "$TRUSTED_RELAY_GCP_CS_SERVICE_ACCOUNT" \
+  --gcp-cs-project-id "$GCP_PROJECT" \
+  --gcp-cs-zone "$GCP_ZONE" \
+  --tls-cert-pem "$TRUSTED_RELAY_SECRET_BROKER_TLS_CERT_PEM" \
+  --tls-key-pem "$TRUSTED_RELAY_SECRET_BROKER_TLS_KEY_PEM" \
+  --provider-token "$TRUSTED_RELAY_PROVIDER_TOKEN"
+```
+
+## Negative Test
+
+Build image `B` after a small trusted-code change and keep verifiers pinned to
+image `A`. Expected failure is `container.image_digest` mismatch after signature
+and nonce validation. No prompt should be forwarded and no provider credential
+should be released.

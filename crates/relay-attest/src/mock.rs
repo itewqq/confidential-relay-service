@@ -47,29 +47,62 @@ fn mock_verifying_key() -> VerifyingKey {
 /// Mock attester that simulates TEE attestation with Ed25519 signatures.
 pub struct MockAttester;
 
+/// Mock attester with an explicitly supplied measurement.
+///
+/// This is useful for tests that need to simulate a changed trusted workload:
+/// the quote is still signed by the mock hardware root, but the measurement no
+/// longer matches the published value.
+pub struct MeasuredMockAttester {
+    measurement: [u8; 32],
+}
+
+impl MockAttester {
+    pub fn with_measurement(measurement: [u8; 32]) -> MeasuredMockAttester {
+        MeasuredMockAttester { measurement }
+    }
+}
+
+fn sign_mock_quote(measurement: [u8; 32], user_data: &[u8; 64]) -> Result<Evidence, AttestError> {
+    let quote = MockQuote {
+        measurement: measurement.to_vec(),
+        user_data: user_data.to_vec(),
+    };
+
+    let payload =
+        serde_json::to_vec(&quote).map_err(|e| AttestError::GenerationFailed(e.to_string()))?;
+
+    let signing_key = mock_signing_key();
+    let signature: Signature = signing_key.sign(&payload);
+
+    // Evidence = payload length (4 bytes LE) || payload || signature (64 bytes)
+    let mut data = Vec::with_capacity(4 + payload.len() + 64);
+    data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    data.extend_from_slice(&payload);
+    data.extend_from_slice(&signature.to_bytes());
+
+    Ok(Evidence {
+        tee_type: TeeType::Mock,
+        data,
+    })
+}
+
 impl Attester for MockAttester {
+    fn name(&self) -> &'static str {
+        "mock (DEVELOPMENT ONLY)"
+    }
+
     fn attest(&self, user_data: &[u8; 64]) -> Result<Evidence, AttestError> {
-        let quote = MockQuote {
-            measurement: mock_measurement().to_vec(),
-            user_data: user_data.to_vec(),
-        };
+        sign_mock_quote(mock_measurement(), user_data)
+    }
+}
 
-        let payload =
-            serde_json::to_vec(&quote).map_err(|e| AttestError::GenerationFailed(e.to_string()))?;
+impl Attester for MeasuredMockAttester {
+    fn name(&self) -> &'static str {
+        "mock with custom measurement (DEVELOPMENT ONLY)"
+    }
 
-        let signing_key = mock_signing_key();
-        let signature: Signature = signing_key.sign(&payload);
-
-        // Evidence = payload length (4 bytes LE) || payload || signature (64 bytes)
-        let mut data = Vec::with_capacity(4 + payload.len() + 64);
-        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        data.extend_from_slice(&payload);
-        data.extend_from_slice(&signature.to_bytes());
-
-        Ok(Evidence {
-            tee_type: TeeType::Mock,
-            data,
-        })
+    fn attest(&self, user_data: &[u8; 64]) -> Result<Evidence, AttestError> {
+        sign_mock_quote(self.measurement, user_data)
     }
 }
 
@@ -195,7 +228,10 @@ mod tests {
 
         let wrong = [0xFFu8; 32];
         let result = verifier.verify(&evidence, Some(&wrong));
-        assert!(matches!(result, Err(AttestError::MeasurementMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(AttestError::MeasurementMismatch { .. })
+        ));
     }
 
     #[test]

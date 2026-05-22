@@ -13,9 +13,11 @@ serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 sha2.workspace = true
 futures-util = "0.3"
 bytes = "1"
 http = "1"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
+url = "2"

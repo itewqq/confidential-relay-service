@@ -12,19 +12,46 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use bytes::Bytes;
 
 use crate::config::RelayConfig;
 use crate::error::AppError;
+use crate::secrets::ProviderCredentialStore;
+
+const FORWARDED_REQUEST_HEADERS: &[&str] = &[
+    "accept",
+    "anthropic-version",
+    "anthropic-beta",
+    "authorization",
+    "openai-beta",
+    "openai-organization",
+    "openai-project",
+    "x-stainless-arch",
+    "x-stainless-lang",
+    "x-stainless-os",
+    "x-stainless-package-version",
+    "x-stainless-runtime",
+    "x-stainless-runtime-version",
+];
+
+const FORWARDED_RESPONSE_HEADERS: &[&str] = &[
+    "content-type",
+    "openai-organization",
+    "openai-processing-ms",
+    "openai-version",
+    "request-id",
+    "x-request-id",
+];
 
 /// Shared application state passed to all handlers.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<RelayConfig>,
     pub http_client: reqwest::Client,
+    pub provider_credentials: ProviderCredentialStore,
 }
 
 /// POST /v1/chat/completions — proxy to upstream.
@@ -43,6 +70,12 @@ pub async fn proxy_chat_completions(
 ) -> Result<Response, AppError> {
     let start = Instant::now();
 
+    if body.len() > state.config.max_request_bytes {
+        return Err(AppError::PayloadTooLarge {
+            limit: state.config.max_request_bytes,
+        });
+    }
+
     // Minimal JSON parsing: extract model name for routing.
     // We parse only what we need and avoid holding the full parsed structure.
     let model = extract_model_name(&body).unwrap_or_default();
@@ -53,17 +86,37 @@ pub async fn proxy_chat_completions(
     let upstream_url = format!("{}{}", upstream_base.trim_end_matches('/'), upstream_path);
 
     // Security check: verify the resolved upstream is in the allowlist.
-    state.config.check_upstream_allowed(upstream_base).map_err(|e| {
-        tracing::error!(upstream = %upstream_base, "blocked request to disallowed upstream");
-        AppError::Internal(format!("upstream not allowed: {e}"))
-    })?;
+    state
+        .config
+        .check_upstream_allowed(upstream_base)
+        .map_err(|e| {
+            tracing::error!(upstream = %upstream_base, "blocked request to disallowed upstream");
+            AppError::Internal(format!("upstream not allowed: {e}"))
+        })?;
 
-    // Forward the Authorization header from the client.
+    // Forward only a small allowlist of provider-relevant headers. Do not copy
+    // hop-by-hop or tracing headers that could leak client metadata. If a
+    // provider credential was injected into the CVM, it replaces any client
+    // Authorization header so upstream provider keys never need to leave the CVM.
     let mut upstream_headers = reqwest::header::HeaderMap::new();
-    if let Some(auth) = headers.get("authorization") {
-        if let Ok(v) = reqwest::header::HeaderValue::from_bytes(auth.as_bytes()) {
-            upstream_headers.insert(reqwest::header::AUTHORIZATION, v);
+    let provider_credential = state.provider_credentials.get().await;
+    for header_name in FORWARDED_REQUEST_HEADERS {
+        if *header_name == "authorization" && provider_credential.is_some() {
+            continue;
         }
+        if let Some(value) = headers.get(*header_name) {
+            if let Ok(name) = reqwest::header::HeaderName::from_bytes(header_name.as_bytes()) {
+                if let Ok(value) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
+                    upstream_headers.insert(name, value);
+                }
+            }
+        }
+    }
+    if let Some(credential) = provider_credential {
+        let value = credential.authorization_value().map_err(|e| {
+            AppError::Internal(format!("invalid injected provider credential: {e}"))
+        })?;
+        upstream_headers.insert(reqwest::header::AUTHORIZATION, value);
     }
     upstream_headers.insert(
         reqwest::header::CONTENT_TYPE,
@@ -86,6 +139,7 @@ pub async fn proxy_chat_completions(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
+    let response_headers = filtered_response_headers(upstream_resp.headers());
 
     // Log metadata only (never payload).
     let latency = start.elapsed();
@@ -105,11 +159,16 @@ pub async fn proxy_chat_completions(
         let stream = upstream_resp.bytes_stream();
         let body = Body::from_stream(stream);
 
-        let response = Response::builder()
-            .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK))
-            .header("content-type", "text/event-stream")
-            .header("cache-control", "no-cache")
-            .header("connection", "keep-alive")
+        let mut builder = Response::builder()
+            .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK));
+        builder = builder.header("content-type", "text/event-stream");
+        builder = builder.header("cache-control", "no-cache");
+
+        for (name, value) in &response_headers {
+            builder = builder.header(name.as_str(), value.as_slice());
+        }
+
+        let response = builder
             .body(body)
             .map_err(|e| AppError::Internal(format!("failed to build response: {e}")))?;
 
@@ -124,16 +183,22 @@ pub async fn proxy_chat_completions(
         let axum_status =
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-        Ok((
-            axum_status,
-            [(
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_str(&content_type)
-                    .unwrap_or_else(|_| HeaderValue::from_static("application/json")),
-            )],
-            resp_body,
-        )
-            .into_response())
+        let mut response = Response::builder().status(axum_status).header(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_str(&content_type)
+                .unwrap_or_else(|_| HeaderValue::from_static("application/json")),
+        );
+
+        for (name, value) in &response_headers {
+            if name == "content-type" {
+                continue;
+            }
+            response = response.header(name.as_str(), value.as_slice());
+        }
+
+        response
+            .body(Body::from(resp_body))
+            .map_err(|e| AppError::Internal(format!("failed to build response: {e}")))
     }
 }
 
@@ -146,4 +211,19 @@ fn extract_model_name(body: &[u8]) -> Option<String> {
 /// Health check endpoint.
 pub async fn health() -> &'static str {
     "ok"
+}
+
+pub fn body_limit(config: &RelayConfig) -> DefaultBodyLimit {
+    DefaultBodyLimit::max(config.max_request_bytes)
+}
+
+fn filtered_response_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, Vec<u8>)> {
+    FORWARDED_RESPONSE_HEADERS
+        .iter()
+        .filter_map(|name| {
+            headers
+                .get(*name)
+                .map(|value| ((*name).to_string(), value.as_bytes().to_vec()))
+        })
+        .collect()
 }
