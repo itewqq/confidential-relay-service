@@ -14,6 +14,41 @@ Why build this?
 
 ![Confidential Relay Service architecture](assets/architecture.png)
 
+## How It Works
+
+This project is trying to make one narrow claim: the relay operator can sell a
+relay service without being able to read or modify the user's prompt/response
+stream between the local client and the selected upstream model provider.
+
+- **Root of trust:** the user trusts the CPU TEE hardware, Google Confidential
+  Space attestation, and the reviewed relay image/config pins, not the relay VM
+  owner, VMM, gateway, or cloud network. See Google Confidential Space
+  [overview](https://cloud.google.com/confidential-computing/confidential-space/docs/confidential-space-overview),
+  Google Cloud [attestation](https://cloud.google.com/confidential-computing/docs/attestation),
+  and AMD SEV-SNP [white paper](https://www.amd.com/content/dam/amd/en/documents/epyc-business-docs/white-papers/SEV-SNP-strengthening-vm-isolation-with-integrity-protection-and-more.pdf).
+- **Workload identity:** Confidential Space issues a signed attestation token
+  that includes container claims such as `container.image_digest` and optional
+  image signature claims. The local proxy rejects the relay unless those claims
+  match the pinned release. See Google Confidential Space
+  [attestation token claims](https://cloud.google.com/confidential-computing/confidential-space/docs/reference/token-claims).
+- **Runtime secrecy from the host:** the relay runs in a Confidential VM. AMD
+  SEV-SNP encrypts guest memory and adds integrity protections against
+  hypervisor attacks such as replay or memory remapping; the VMM should not be
+  able to read or rewrite relay memory at runtime, modulo hardware/firmware bugs
+  and side channels. See Google Confidential VM
+  [overview](https://cloud.google.com/confidential-computing/confidential-vm/docs/confidential-vm-overview).
+- **Attested TLS:** the CVM generates the TLS key inside the attested workload.
+  The attestation nonce binds `SHA-384(TLS SPKI)` plus the relay
+  `config_hash`, so the local proxy knows the TLS endpoint is the measured
+  workload with the reviewed config, not a gateway MITM.
+- **Gateway is blind:** the public gateway handles user auth, quota, billing,
+  and CONNECT routing, but it only forwards encrypted bytes. It sees metadata
+  like user identity, IPs, timing, and byte counts, not prompt plaintext.
+- **Provider boundary:** the CVM replaces user auth with the operator's upstream
+  provider credential, verifies the upstream provider's WebPKI/hostname and
+  configured leaf-certificate pin, then sends the request. The upstream model
+  provider sees plaintext because it is the intended recipient.
+
 ## Quick Start
 
 ### 1. Put Secrets In `.env`
