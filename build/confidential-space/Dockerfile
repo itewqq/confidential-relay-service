@@ -1,8 +1,17 @@
 # Trusted Relay production container for Google Cloud Confidential Space.
 # The workload identity is the immutable image digest/signature in the
 # Confidential Space attestation token, not a raw SEV-SNP MEASUREMENT.
+#
+# Supply-chain note: release builds should pass digest-pinned base references:
+#   docker build \
+#     --build-arg RUST_BASE_IMAGE=mirror.gcr.io/library/rust:1.95.0-bookworm@sha256:... \
+#     --build-arg RUNTIME_BASE_IMAGE=gcr.io/distroless/cc-debian12@sha256:...
+# Tags remain the default only so contributors can build the prototype locally.
 
-FROM mirror.gcr.io/library/rust:1.95.0-bookworm AS builder
+ARG RUST_BASE_IMAGE=mirror.gcr.io/library/rust:1.95.0-bookworm
+ARG RUNTIME_BASE_IMAGE=gcr.io/distroless/cc-debian12
+
+FROM ${RUST_BASE_IMAGE} AS builder
 WORKDIR /src
 
 COPY Cargo.toml Cargo.lock ./
@@ -40,7 +49,7 @@ RUN cargo build --release --locked -p trusted-relay-server \
       --no-default-features --features tee-gcp-confidential-space && \
     cp target/release/trusted-relay-server /usr/local/bin/trusted-relay-server
 
-FROM gcr.io/distroless/cc-debian12
+FROM ${RUNTIME_BASE_IMAGE}
 COPY --from=builder /usr/local/bin/trusted-relay-server /usr/local/bin/trusted-relay-server
 EXPOSE 8443 8788
 ENV TRUSTED_RELAY_GCP_CS_AUDIENCE=trusted-relay-attested-tls

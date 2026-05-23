@@ -24,6 +24,9 @@ authenticate users and meter usage, but it does not terminate attested TLS.
 
 - The local proxy is user trust code. It must pin the expected image digest or
   image signature key and `RelayConfig::config_hash()`.
+- `RelayConfig::config_hash()` covers both upstream-routing policy and
+  security-relevant runtime policy. It intentionally excludes deploy-only
+  addresses and secret token material.
 - The gateway/control plane is not trusted with prompt plaintext. It may enforce
   users, billing, quotas, abuse controls, and revocation.
 - The CVM is the prompt-handling TCB. It must be private-only and run the pinned
@@ -93,7 +96,9 @@ user-to-CVM connection is attested TLS inside the CONNECT tunnel.
 - Firewall allows relay admin port only from the private operator service.
 - Gateway only supports CONNECT to the configured relay address.
 - Local proxy and online checker fail closed without workload identity/config pins.
-- Upstream TLS leaf pins are part of the attested config hash.
+- Runtime policy and upstream TLS leaf pins are part of the attested config hash.
+- Release builds use digest-pinned base images and record base refs, source
+  commit, final image digest, config hash, and negative-test evidence.
 - Provider credential injection is one-shot and never logged.
 - Logs remain metadata-only; prompt, response, provider token, and local user
   token are not logged.

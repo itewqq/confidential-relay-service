@@ -14,7 +14,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use relay_attest::Attester;
-use relay_core::config::RelayConfig;
+use relay_core::config::{RelayConfig, RuntimeConfig};
 use relay_core::proxy::{build_upstream_http_client, AppState};
 use relay_core::router::build_router;
 use relay_core::secrets::{ProviderCredential, ProviderCredentialStore};
@@ -134,6 +134,7 @@ async fn main() -> Result<()> {
             "TRUSTED_RELAY_ALLOW_CLIENT_PROVIDER_AUTH is enabled; this is development-only"
         );
     }
+    let provider_auth_scheme = cli.provider_auth_scheme.trim().to_string();
 
     // Select attester based on available TEE.
     let attester: Box<dyn Attester> = select_attester();
@@ -155,6 +156,12 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(RelayConfig {
         listen_addr: cli.listen.clone(),
+        runtime: RuntimeConfig {
+            allow_client_provider_auth: cli.allow_client_provider_auth,
+            private_admin_enabled: cli.admin_listen.is_some(),
+            provider_auth_scheme: provider_auth_scheme.clone(),
+            body_log_policy: "metadata-only".to_string(),
+        },
         default_upstream: cli.upstream,
         allowed_upstreams,
         max_request_bytes: cli.max_request_bytes,
@@ -191,7 +198,7 @@ async fn main() -> Result<()> {
     if let Some(provider_token) = cli.provider_token {
         provider_credentials
             .set(ProviderCredential {
-                auth_scheme: cli.provider_auth_scheme.clone(),
+                auth_scheme: provider_auth_scheme.clone(),
                 token: provider_token,
             })
             .await;

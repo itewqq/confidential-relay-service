@@ -14,6 +14,9 @@ Options:
   --tag TAG              Image tag (default: git short SHA or timestamp).
   --no-push              Build locally but do not push.
   --platform PLATFORM    Container platform (default: linux/amd64 for GCP N2D).
+  --rust-base IMAGE      Builder base image ref. Use @sha256 for releases.
+  --runtime-base IMAGE   Runtime base image ref. Use @sha256 for releases.
+  --require-pinned-bases Fail unless both base refs include @sha256:.
   -h, --help             Show this help.
 
 Outputs:
@@ -29,6 +32,9 @@ REPO=trusted-relay
 TAG=$(git rev-parse --short=12 HEAD 2>/dev/null || date +%Y%m%d%H%M%S)
 PUSH=1
 PLATFORM=linux/amd64
+RUST_BASE_IMAGE=mirror.gcr.io/library/rust:1.95.0-bookworm
+RUNTIME_BASE_IMAGE=gcr.io/distroless/cc-debian12
+REQUIRE_PINNED_BASES=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -38,6 +44,9 @@ while [ "$#" -gt 0 ]; do
     --tag) TAG=${2:?missing --tag value}; shift 2 ;;
     --no-push) PUSH=0; shift ;;
     --platform) PLATFORM=${2:?missing --platform value}; shift 2 ;;
+    --rust-base) RUST_BASE_IMAGE=${2:?missing --rust-base value}; shift 2 ;;
+    --runtime-base) RUNTIME_BASE_IMAGE=${2:?missing --runtime-base value}; shift 2 ;;
+    --require-pinned-bases) REQUIRE_PINNED_BASES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -46,6 +55,15 @@ done
 if [ -z "$PROJECT" ]; then
   echo "no GCP project configured; pass --project" >&2
   exit 1
+fi
+
+if [ "$REQUIRE_PINNED_BASES" = "1" ]; then
+  for ref in "$RUST_BASE_IMAGE" "$RUNTIME_BASE_IMAGE"; do
+    if [[ "$ref" != *@sha256:* ]]; then
+      echo "base image must be digest-pinned with --require-pinned-bases: $ref" >&2
+      exit 2
+    fi
+  done
 fi
 
 HOST="$REGION-docker.pkg.dev"
@@ -62,7 +80,11 @@ fi
 
 gcloud auth configure-docker "$HOST" --quiet >/dev/null
 
-docker build --platform "$PLATFORM" -f build/confidential-space/Dockerfile -t "$IMAGE" .
+docker build --platform "$PLATFORM" \
+  --build-arg "RUST_BASE_IMAGE=$RUST_BASE_IMAGE" \
+  --build-arg "RUNTIME_BASE_IMAGE=$RUNTIME_BASE_IMAGE" \
+  -f build/confidential-space/Dockerfile \
+  -t "$IMAGE" .
 
 if [ "$PUSH" = "1" ]; then
   docker push "$IMAGE"
@@ -77,6 +99,8 @@ else
 fi
 
 echo "image_ref=$IMAGE"
+echo "rust_base_image=$RUST_BASE_IMAGE"
+echo "runtime_base_image=$RUNTIME_BASE_IMAGE"
 if [ -n "${DIGEST:-}" ]; then
   echo "image_digest=$DIGEST"
   echo "image_ref_with_digest=$HOST/$PROJECT/$REPO/trusted-relay-confidential-space@$DIGEST"

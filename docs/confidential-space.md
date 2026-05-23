@@ -38,7 +38,10 @@ The verifier checks:
 tools/gcp/build-confidential-space-image.sh \
   --project "$GCP_PROJECT" \
   --region "$GCP_REGION" \
-  --repo trusted-relay
+  --repo trusted-relay \
+  --require-pinned-bases \
+  --rust-base "$TRUSTED_RELAY_RUST_BASE_IMAGE" \
+  --runtime-base "$TRUSTED_RELAY_RUNTIME_BASE_IMAGE"
 ```
 
 Record the printed `image_ref_with_digest` and `image_digest`.
@@ -65,6 +68,10 @@ runtime configuration and the private admin listener address. Provider keys are
 pushed later from a private operator service to the private admin port.
 `TRUSTED_RELAY_UPSTREAM_TLS_LEAF_SHA256` is non-secret config in
 `ORIGIN=sha256:<64-hex>` form; it is folded into `RelayConfig::config_hash()`.
+The config hash also covers security-relevant runtime policy: whether client
+provider auth is allowed, whether the private admin endpoint is enabled, the
+provider auth scheme, and the relay-owned body logging policy. It deliberately
+excludes deploy-only addresses and secret token material.
 
 ## Inject Provider Credential
 
@@ -114,6 +121,9 @@ cargo run -p trusted-relay-online-check --no-default-features \
   --gcp-cs-zone "$GCP_ZONE" \
   --expected-config-hash "$TRUSTED_RELAY_EXPECTED_CONFIG_HASH" \
   --upstream-tls-leaf-sha256 "$TRUSTED_RELAY_UPSTREAM_TLS_LEAF_SHA256" \
+  --private-admin-enabled \
+  --provider-auth-scheme Bearer \
+  --body-log-policy metadata-only \
   --health
 ```
 

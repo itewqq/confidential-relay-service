@@ -12,7 +12,7 @@ use relay_attest::quote::{extract_evidence_from_cert, extract_spki_from_cert};
 use relay_attest::sev_snp::SevSnpVerifier;
 use relay_attest::traits::Verifier;
 use relay_attest::types::TeeType;
-use relay_core::config::{ProviderConfig, RelayConfig};
+use relay_core::config::{ProviderConfig, RelayConfig, RuntimeConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::verify_tls12_signature as crypto_verify_tls12;
 use rustls::crypto::verify_tls13_signature as crypto_verify_tls13;
@@ -102,6 +102,22 @@ struct Cli {
     /// Upstream TLS leaf certificate pin in ORIGIN=sha256:<64-hex> form. Can be repeated.
     #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
     upstream_tls_leaf_sha256: Vec<String>,
+
+    /// Config-hashed runtime flag: relay may forward client Authorization if no provider credential is injected.
+    #[arg(long)]
+    allow_client_provider_auth: bool,
+
+    /// Config-hashed runtime flag: private provider-credential admin endpoint is enabled.
+    #[arg(long)]
+    private_admin_enabled: bool,
+
+    /// Config-hashed expected provider Authorization scheme.
+    #[arg(long, default_value = "Bearer")]
+    provider_auth_scheme: String,
+
+    /// Config-hashed relay-owned body logging policy. Current production value is metadata-only.
+    #[arg(long, default_value = "metadata-only")]
+    body_log_policy: String,
 
     /// Only fetch and print measurement/config/report details; do not enforce strict pins.
     #[arg(long)]
@@ -419,6 +435,12 @@ fn compute_expected_config_hash(cli: &Cli) -> Result<[u8; 32]> {
 
     let config = RelayConfig {
         listen_addr: "0.0.0.0:8443".to_string(),
+        runtime: RuntimeConfig {
+            allow_client_provider_auth: cli.allow_client_provider_auth,
+            private_admin_enabled: cli.private_admin_enabled,
+            provider_auth_scheme: cli.provider_auth_scheme.clone(),
+            body_log_policy: cli.body_log_policy.clone(),
+        },
         default_upstream: cli.upstream.clone(),
         routes,
         allowed_upstreams,

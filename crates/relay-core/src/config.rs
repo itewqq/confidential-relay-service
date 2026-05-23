@@ -19,7 +19,16 @@ use url::Url;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
     /// Address to listen on (e.g. "0.0.0.0:8443").
+    ///
+    /// This is intentionally not included in `config_hash()` because it is a
+    /// deployment coordinate; the local proxy pins the endpoint it connects to.
     pub listen_addr: String,
+
+    /// Security-relevant process/runtime choices that clients should be able to
+    /// verify through `config_hash()`. Keep deploy-only addresses and secret
+    /// material out of this struct.
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
 
     /// Default upstream URL if no model-specific route matches.
     pub default_upstream: String,
@@ -82,10 +91,102 @@ pub struct ProviderConfig {
     pub path: Option<String>,
 }
 
+/// Security-relevant runtime choices that are not upstream routes but still
+/// affect the confidentiality/integrity contract clients verify.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeConfig {
+    /// If true, the relay may forward a client-supplied Authorization header to
+    /// the upstream when no provider credential has been injected.
+    /// Production clients should expect this to be false.
+    #[serde(default)]
+    pub allow_client_provider_auth: bool,
+
+    /// If true, the relay starts the one-shot private admin credential-injection
+    /// endpoint. This does not include the listen address because that is a
+    /// deploy-only network coordinate protected by VPC/firewall policy.
+    #[serde(default)]
+    pub private_admin_enabled: bool,
+
+    /// Expected provider Authorization scheme for injected credentials.
+    /// The token itself is secret runtime material and is never hashed.
+    #[serde(default = "default_provider_auth_scheme")]
+    pub provider_auth_scheme: String,
+
+    /// Body logging policy for the relay-owned code path. Current production
+    /// code supports only `metadata-only`; request/response bodies are not
+    /// logged or persisted by the relay.
+    #[serde(default = "default_body_log_policy")]
+    pub body_log_policy: String,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            allow_client_provider_auth: false,
+            private_admin_enabled: false,
+            provider_auth_scheme: default_provider_auth_scheme(),
+            body_log_policy: default_body_log_policy(),
+        }
+    }
+}
+
+fn default_provider_auth_scheme() -> String {
+    "Bearer".to_string()
+}
+
+fn default_body_log_policy() -> String {
+    "metadata-only".to_string()
+}
+
+impl RuntimeConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_http_token(&self.provider_auth_scheme, "provider_auth_scheme")?;
+        if self.body_log_policy != "metadata-only" {
+            return Err(format!(
+                "body_log_policy must be 'metadata-only', got '{}'",
+                self.body_log_policy
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_http_token(value: &str, field: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    if !value.bytes().all(is_http_tchar) {
+        return Err(format!("{field} must be a valid HTTP token"));
+    }
+    Ok(())
+}
+
+fn is_http_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
 impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:8443".to_string(),
+            runtime: RuntimeConfig::default(),
             default_upstream: "https://api.openai.com".to_string(),
             routes: BTreeMap::new(),
             allowed_upstreams: Vec::new(),
@@ -293,6 +394,7 @@ impl RelayConfig {
     /// Validate that all configured routes point to allowed upstreams.
     /// Call this at startup to catch misconfiguration early.
     pub fn validate(&self) -> Result<(), String> {
+        self.runtime.validate()?;
         if let Some(digest) = &self.release_artifact_digest {
             validate_release_artifact_digest(digest)?;
         }
@@ -326,6 +428,29 @@ impl RelayConfig {
         use sha2::{Digest, Sha256};
 
         let mut hasher = Sha256::new();
+
+        hasher.update(b"config_hash_schema:v2\n");
+
+        hasher.update(b"runtime.allow_client_provider_auth:");
+        hasher.update(if self.runtime.allow_client_provider_auth {
+            b"true".as_slice()
+        } else {
+            b"false".as_slice()
+        });
+        hasher.update(b"\n");
+        hasher.update(b"runtime.private_admin_enabled:");
+        hasher.update(if self.runtime.private_admin_enabled {
+            b"true".as_slice()
+        } else {
+            b"false".as_slice()
+        });
+        hasher.update(b"\n");
+        hasher.update(b"runtime.provider_auth_scheme:");
+        hasher.update(self.runtime.provider_auth_scheme.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(b"runtime.body_log_policy:");
+        hasher.update(self.runtime.body_log_policy.as_bytes());
+        hasher.update(b"\n");
 
         // Hash default upstream.
         hasher.update(b"default_upstream:");
@@ -761,6 +886,69 @@ mod tests {
         };
 
         assert_ne!(config_a.config_hash(), config_b.config_hash());
+    }
+
+    #[test]
+    fn config_hash_differs_when_runtime_security_flags_change() {
+        let config_a = RelayConfig::default();
+        let config_b = RelayConfig {
+            runtime: RuntimeConfig {
+                allow_client_provider_auth: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config_c = RelayConfig {
+            runtime: RuntimeConfig {
+                private_admin_enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_ne!(config_a.config_hash(), config_b.config_hash());
+        assert_ne!(config_a.config_hash(), config_c.config_hash());
+        assert_ne!(config_b.config_hash(), config_c.config_hash());
+    }
+
+    #[test]
+    fn config_hash_differs_when_runtime_policy_changes() {
+        let config_a = RelayConfig::default();
+        let config_b = RelayConfig {
+            runtime: RuntimeConfig {
+                provider_auth_scheme: "Basic".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_ne!(config_a.config_hash(), config_b.config_hash());
+    }
+
+    #[test]
+    fn validate_rejects_body_logging_policy_that_is_not_metadata_only() {
+        let config = RelayConfig {
+            runtime: RuntimeConfig {
+                body_log_policy: "full-body".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_provider_auth_scheme() {
+        let config = RelayConfig {
+            runtime: RuntimeConfig {
+                provider_auth_scheme: "Bearer token".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_err());
     }
 
     #[test]

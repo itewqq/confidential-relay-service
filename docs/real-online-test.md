@@ -23,7 +23,10 @@ tools/gcp/build-confidential-space-image.sh \
   --project "$GCP_PROJECT" \
   --region "$GCP_REGION" \
   --repo trusted-relay \
-  --tag release-a
+  --tag release-a \
+  --require-pinned-bases \
+  --rust-base "$TRUSTED_RELAY_RUST_BASE_IMAGE" \
+  --runtime-base "$TRUSTED_RELAY_RUNTIME_BASE_IMAGE"
 ```
 
 2. Record:
@@ -66,6 +69,9 @@ cargo run -p trusted-relay-online-check --no-default-features \
   --gcp-cs-project-id "$GCP_PROJECT" \
   --gcp-cs-zone "$GCP_ZONE" \
   --upstream-tls-leaf-sha256 "$TRUSTED_RELAY_UPSTREAM_TLS_LEAF_SHA256" \
+  --private-admin-enabled \
+  --provider-auth-scheme Bearer \
+  --body-log-policy metadata-only \
   --expected-config-hash "$TRUSTED_RELAY_EXPECTED_CONFIG_HASH" \
   --health
 ```
@@ -260,3 +266,62 @@ gcloud artifacts repositories list --project "$GCP_PROJECT" --location "$GCP_REG
 gcloud compute instances list --project "$GCP_PROJECT" --filter="name ~ 'trusted|relay|cvm|confidential'"
 gcloud compute disks list --project "$GCP_PROJECT" --filter="name ~ 'trusted|relay|cvm|confidential'"
 ```
+
+## May 23, 2026 Hardening GCP E2E
+
+After adding config-hashed runtime policy and pinned-base build controls, a live
+GCP Confidential Space smoke test was run again. The relay used the new config
+hash schema that includes runtime policy (`private_admin_enabled=true`,
+`allow_client_provider_auth=false`, provider auth scheme `Bearer`, and body log
+policy `metadata-only`) plus upstream TLS leaf pinning.
+
+```text
+image_digest=sha256:f2ff5b5490985a0d0b2f17faab662afdb0acd9835cdf54453747fde548dfe025
+relay_config_hash=66bec54c788d75f95d795208c9d3bf1551ecb2d1d564a1bdaac2545bec4705f0
+upstream_tls_leaf_sha256=https://api.openai.com=sha256:46b4925a67f673d37d085a90cffd2adc685ce51df10d626a641cd0e5479df229
+service_account=365884490266-compute@developer.gserviceaccount.com
+provider_injection=204 No Content
+admin_health_after_injection={"ok":true,"provider_credential_loaded":true}
+```
+
+Strict online verification used live Google JWKS and accepted the endpoint only
+after checking image digest, service account, project, zone, and config hash:
+
+```text
+token.issuer=https://confidentialcomputing.googleapis.com
+token.audience=trusted-relay-attested-tls
+token.swname=CONFIDENTIAL_SPACE
+token.dbgstat=disabled-since-boot
+token.service_accounts=["365884490266-compute@developer.gserviceaccount.com"]
+token.container.image_digest=sha256:f2ff5b5490985a0d0b2f17faab662afdb0acd9835cdf54453747fde548dfe025
+token.gce.project_id=stone-botany-277908
+token.gce.zone=us-central1-a
+RESULT: OK - GcpConfidentialSpace/Strict verification succeeded
+health.status=HTTP/1.1 200 OK
+health.body=ok
+```
+
+The local proxy then sent a real OpenAI-compatible request through attested TLS
+to the private relay. The relay forwarded to OpenAI only after upstream
+WebPKI/hostname and leaf-pin validation:
+
+```text
+HTTP/1.1 200 OK
+model=gpt-4o-mini-2024-07-18
+content=relay-ok
+usage={prompt_tokens: 12, completion_tokens: 2, total_tokens: 14}
+```
+
+A live negative check pinned the verifier to a wrong image digest. Google token
+signature verification and nonce parsing completed, then policy failed before
+prompt forwarding:
+
+```text
+token.container.image_digest=sha256:f2ff5b5490985a0d0b2f17faab662afdb0acd9835cdf54453747fde548dfe025
+Error: attestation evidence verification failed
+Caused by:
+    Confidential Space image digest mismatch: expected sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, got sha256:f2ff5b5490985a0d0b2f17faab662afdb0acd9835cdf54453747fde548dfe025
+```
+
+All throwaway Compute, firewall, Cloud NAT/router, and Artifact Registry
+resources were deleted after the test.

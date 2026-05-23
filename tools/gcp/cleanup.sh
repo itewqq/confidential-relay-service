@@ -44,6 +44,7 @@ delete_firewall trusted-relay-gateway-connect
 delete_firewall trusted-relay-cvm-private
 delete_firewall trusted-relay-iap-ssh
 delete_firewall trusted-relay-iap-relay
+delete_firewall trusted-relay-operator-ssh
 
 for image in $(gcloud compute images list --project="$PROJECT" --no-standard-images --filter='name~^trusted-relay' --format='value(name)'); do
   gcloud compute images delete "$image" --project="$PROJECT" --quiet

@@ -86,7 +86,10 @@ cargo test -p trusted-relay-local --features gcp-confidential-space --test gatew
 tools/gcp/build-confidential-space-image.sh \
   --project "$GCP_PROJECT" \
   --region "$GCP_REGION" \
-  --repo trusted-relay
+  --repo trusted-relay \
+  --require-pinned-bases \
+  --rust-base "$TRUSTED_RELAY_RUST_BASE_IMAGE" \
+  --runtime-base "$TRUSTED_RELAY_RUNTIME_BASE_IMAGE"
 ```
 
 Record the printed `image_ref_with_digest` and `image_digest`, then update your
@@ -178,7 +181,7 @@ attested TLS session that terminates inside the private CVM.
 - **Prompt/API content from the relay service:** gateway, cloud host, network path, and relay operator do not terminate the attested TLS session.
 - **Relay-side body logging:** the public gateway cannot decrypt prompt/response bodies, and the attested CVM code path does not log or persist request/response bodies.
 - **Trusted code identity:** clients pin `submods.container.image_digest` or an image signature key.
-- **Config identity:** `RelayConfig::config_hash()` covers upstream allowlists, routes, size limits, timeout, and release metadata.
+- **Config identity:** `RelayConfig::config_hash()` covers runtime policy, upstream allowlists, routes, size limits, timeout, release metadata, and upstream TLS pins.
 - **TLS endpoint binding:** attestation nonces bind `SHA-384(TLS SPKI)` to the attested certificate.
 - **Upstream TLS pinning:** the CVM verifies normal WebPKI/hostname plus config-bound upstream leaf SHA-256 pins before sending request bytes.
 - **Provider key separation:** users never receive the provider key; it is injected after CVM launch through a private admin path.
@@ -234,7 +237,9 @@ tools/online-check/        Live endpoint verifier
 
 - `tee-mock` requires `TRUSTED_RELAY_DEV_MOCK=1` and is development-only.
 - Strict production use requires workload identity pins and `expected_config_hash`.
-- Upstream leaf certificate pins are included in `expected_config_hash`; keep a rotation set ready because public provider leaf certs can rotate.
+- Runtime policy (`allow_client_provider_auth`, private admin enabled, provider auth scheme, body logging policy) and upstream leaf certificate pins are included in `expected_config_hash`.
+- Keep an upstream leaf-pin rotation set ready because public provider leaf certs can rotate.
+- Release builds should use digest-pinned base images; see `docs/supply-chain.md`.
 - `TrustOnFirstUse` intentionally fails until persistent pinning is implemented.
 - In the relay-owned code path, request and response bodies are not logged; error logs redact token-like text.
 - Injected-provider `401/403` bodies are sanitized before returning to local users.
