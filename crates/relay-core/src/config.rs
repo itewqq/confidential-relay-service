@@ -86,8 +86,11 @@ pub struct ProviderConfig {
     /// Base URL for the provider's API (e.g. "https://api.openai.com").
     pub base_url: String,
 
-    /// The path to forward to (e.g. "/v1/chat/completions").
+    /// Absolute path to forward to (e.g. "/v1/chat/completions").
     /// If not set, uses the same path as the incoming request.
+    ///
+    /// Paths are treated strictly as paths, never as URL references, so they
+    /// cannot change scheme, authority, host, or port.
     pub path: Option<String>,
 }
 
@@ -238,6 +241,32 @@ fn is_local_http_url(parsed: &Url) -> bool {
         })
 }
 
+fn validate_upstream_base_url(raw: &str, field: &str) -> Result<Url, String> {
+    let parsed = Url::parse(raw).map_err(|e| format!("{field} is not a valid URL: {e}"))?;
+    if url_origin(raw).is_none() {
+        return Err(format!(
+            "{field} must use https:// (or loopback http:// for development), include a host, and contain no userinfo"
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(format!("{field} must not include a query or fragment"));
+    }
+    Ok(parsed)
+}
+
+fn validate_upstream_path(path: &str) -> Result<(), String> {
+    if path.is_empty() || !path.starts_with('/') {
+        return Err("upstream path must be a non-empty absolute path beginning with '/'".to_string());
+    }
+    if path.starts_with("//") {
+        return Err("upstream path must not be scheme-relative ('//...')".to_string());
+    }
+    if path.contains('?') || path.contains('#') || path.contains('\r') || path.contains('\n') {
+        return Err("upstream path must not contain query, fragment, or control delimiters".to_string());
+    }
+    Ok(())
+}
+
 fn validate_release_artifact_digest(raw: &str) -> Result<(), String> {
     let digest = raw.trim();
     let hex = digest
@@ -309,8 +338,6 @@ impl RelayConfig {
     ///
     /// Returns `(base_url, optional_path_override)`.
     pub fn resolve_upstream(&self, model: &str) -> (&str, Option<&str>) {
-        // Sort routes by key length (descending) for longest-prefix-first matching.
-        // BTreeMap gives us sorted order, but we need length-based ordering.
         let mut routes: Vec<_> = self.routes.iter().collect();
         routes.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
@@ -322,6 +349,26 @@ impl RelayConfig {
         (&self.default_upstream, None)
     }
 
+    /// Construct an upstream request URL without ever interpreting the route
+    /// path as a URL reference. The final URL is checked against the allowlist.
+    pub fn build_upstream_url(&self, base_url: &str, path: &str) -> Result<Url, String> {
+        validate_upstream_path(path)?;
+        let mut url = validate_upstream_base_url(base_url, "upstream base URL")?;
+
+        let base_path = url.path().trim_end_matches('/');
+        let combined_path = if base_path.is_empty() || base_path == "/" {
+            path.to_string()
+        } else {
+            format!("{base_path}{path}")
+        };
+        url.set_path(&combined_path);
+        url.set_query(None);
+        url.set_fragment(None);
+
+        self.check_upstream_allowed(url.as_str())?;
+        Ok(url)
+    }
+
     /// Check whether a resolved upstream URL is allowed by the allowlist.
     ///
     /// Comparison is done on the URL **origin** (scheme + host + port) to prevent
@@ -330,8 +377,6 @@ impl RelayConfig {
     ///
     /// If `allowed_upstreams` is empty, all upstreams are allowed (development mode).
     /// In production, this list should be non-empty.
-    ///
-    /// Returns `Ok(())` if allowed, or `Err(reason)` if blocked.
     pub fn check_upstream_allowed(&self, upstream_url: &str) -> Result<(), String> {
         if self.allowed_upstreams.is_empty() {
             tracing::warn!(
@@ -391,21 +436,28 @@ impl RelayConfig {
             .collect())
     }
 
-    /// Validate that all configured routes point to allowed upstreams.
-    /// Call this at startup to catch misconfiguration early.
+    /// Validate all security-relevant upstream configuration.
     pub fn validate(&self) -> Result<(), String> {
         self.runtime.validate()?;
         if let Some(digest) = &self.release_artifact_digest {
             validate_release_artifact_digest(digest)?;
         }
         normalize_upstream_tls_pins(&self.upstream_tls_leaf_sha256)?;
+
+        validate_upstream_base_url(&self.default_upstream, "default upstream")?;
         if !self.allowed_upstreams.is_empty() {
-            // Check default upstream.
             self.check_upstream_allowed(&self.default_upstream)
                 .map_err(|e| format!("default upstream not allowed: {e}"))?;
+        }
 
-            // Check all route upstreams.
-            for (prefix, config) in &self.routes {
+        for (prefix, config) in &self.routes {
+            validate_upstream_base_url(&config.base_url, &format!("route '{prefix}' upstream"))?;
+            if let Some(path) = &config.path {
+                validate_upstream_path(path)
+                    .map_err(|e| format!("route '{prefix}' has invalid path: {e}"))?;
+                self.build_upstream_url(&config.base_url, path)
+                    .map_err(|e| format!("route '{prefix}' invalid final upstream URL: {e}"))?;
+            } else if !self.allowed_upstreams.is_empty() {
                 self.check_upstream_allowed(&config.base_url)
                     .map_err(|e| format!("route '{prefix}' upstream not allowed: {e}"))?;
             }
@@ -415,95 +467,118 @@ impl RelayConfig {
 
     /// Compute a deterministic hash of the security-critical configuration.
     ///
-    /// This hash covers:
-    /// - The default upstream URL
-    /// - All route upstream URLs (sorted deterministically)
-    /// - The allowed upstreams list (sorted)
-    ///
-    /// The result can be embedded in the attestation REPORTDATA so clients can
-    /// verify which upstream configuration the relay is running with.
+    /// Schema v3 uses length-prefixed fields rather than delimiter-based text.
+    /// This makes field boundaries unambiguous even when values contain strings
+    /// such as `|path:` or newlines, preventing two different configurations
+    /// from producing the same serialized hash input.
     ///
     /// Returns a 32-byte SHA-256 hash.
     pub fn config_hash(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
 
-        let mut hasher = Sha256::new();
-
-        hasher.update(b"config_hash_schema:v2\n");
-
-        hasher.update(b"runtime.allow_client_provider_auth:");
-        hasher.update(if self.runtime.allow_client_provider_auth {
-            b"true".as_slice()
-        } else {
-            b"false".as_slice()
-        });
-        hasher.update(b"\n");
-        hasher.update(b"runtime.private_admin_enabled:");
-        hasher.update(if self.runtime.private_admin_enabled {
-            b"true".as_slice()
-        } else {
-            b"false".as_slice()
-        });
-        hasher.update(b"\n");
-        hasher.update(b"runtime.provider_auth_scheme:");
-        hasher.update(self.runtime.provider_auth_scheme.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(b"runtime.body_log_policy:");
-        hasher.update(self.runtime.body_log_policy.as_bytes());
-        hasher.update(b"\n");
-
-        // Hash default upstream.
-        hasher.update(b"default_upstream:");
-        hasher.update(self.default_upstream.as_bytes());
-        hasher.update(b"\n");
-
-        // Hash routes (BTreeMap is already sorted by key).
-        for (prefix, config) in &self.routes {
-            hasher.update(b"route:");
-            hasher.update(prefix.as_bytes());
-            hasher.update(b"=>");
-            hasher.update(config.base_url.as_bytes());
-            if let Some(ref path) = config.path {
-                hasher.update(b"|path:");
-                hasher.update(path.as_bytes());
-            }
-            hasher.update(b"\n");
+        fn put(hasher: &mut Sha256, label: &str, value: &[u8]) {
+            let label = label.as_bytes();
+            hasher.update((label.len() as u64).to_be_bytes());
+            hasher.update(label);
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
         }
 
-        // Hash allowed upstreams (sorted for determinism).
+        let mut hasher = Sha256::new();
+        put(&mut hasher, "schema", b"config_hash_schema:v3");
+        put(
+            &mut hasher,
+            "runtime.allow_client_provider_auth",
+            &[self.runtime.allow_client_provider_auth as u8],
+        );
+        put(
+            &mut hasher,
+            "runtime.private_admin_enabled",
+            &[self.runtime.private_admin_enabled as u8],
+        );
+        put(
+            &mut hasher,
+            "runtime.provider_auth_scheme",
+            self.runtime.provider_auth_scheme.as_bytes(),
+        );
+        put(
+            &mut hasher,
+            "runtime.body_log_policy",
+            self.runtime.body_log_policy.as_bytes(),
+        );
+        put(
+            &mut hasher,
+            "default_upstream",
+            self.default_upstream.as_bytes(),
+        );
+
+        put(
+            &mut hasher,
+            "routes.count",
+            &(self.routes.len() as u64).to_be_bytes(),
+        );
+        for (prefix, config) in &self.routes {
+            put(&mut hasher, "route.prefix", prefix.as_bytes());
+            put(&mut hasher, "route.base_url", config.base_url.as_bytes());
+            match &config.path {
+                Some(path) => {
+                    put(&mut hasher, "route.path.present", &[1]);
+                    put(&mut hasher, "route.path", path.as_bytes());
+                }
+                None => put(&mut hasher, "route.path.present", &[0]),
+            }
+        }
+
         let mut sorted_allowed = self.allowed_upstreams.clone();
         sorted_allowed.sort();
+        put(
+            &mut hasher,
+            "allowed_upstreams.count",
+            &(sorted_allowed.len() as u64).to_be_bytes(),
+        );
         for allowed in &sorted_allowed {
-            hasher.update(b"allowed:");
-            hasher.update(allowed.as_bytes());
-            hasher.update(b"\n");
+            put(&mut hasher, "allowed_upstream", allowed.as_bytes());
         }
 
-        hasher.update(b"max_request_bytes:");
-        hasher.update(self.max_request_bytes.to_string().as_bytes());
-        hasher.update(b"\n");
-
-        if let Some(digest) = &self.release_artifact_digest {
-            hasher.update(b"release_artifact_digest:");
-            hasher.update(digest.trim().to_ascii_lowercase().as_bytes());
-            hasher.update(b"\n");
-        }
-
-        hasher.update(b"upstream_timeout_secs:");
-        hasher.update(self.upstream_timeout_secs.to_string().as_bytes());
-        hasher.update(b"\n");
-
-        for (origin, pins) in normalize_upstream_tls_pins(&self.upstream_tls_leaf_sha256)
-            .expect("RelayConfig::validate checks upstream TLS pins")
-        {
-            hasher.update(b"upstream_tls_leaf_sha256:");
-            hasher.update(origin.as_bytes());
-            hasher.update(b"=>");
-            for pin in pins {
-                hasher.update(pin.as_bytes());
-                hasher.update(b",");
+        put(
+            &mut hasher,
+            "max_request_bytes",
+            &(self.max_request_bytes as u64).to_be_bytes(),
+        );
+        match &self.release_artifact_digest {
+            Some(digest) => {
+                put(&mut hasher, "release_artifact_digest.present", &[1]);
+                put(
+                    &mut hasher,
+                    "release_artifact_digest",
+                    digest.trim().to_ascii_lowercase().as_bytes(),
+                );
             }
-            hasher.update(b"\n");
+            None => put(&mut hasher, "release_artifact_digest.present", &[0]),
+        }
+        put(
+            &mut hasher,
+            "upstream_timeout_secs",
+            &self.upstream_timeout_secs.to_be_bytes(),
+        );
+
+        let normalized_pins = normalize_upstream_tls_pins(&self.upstream_tls_leaf_sha256)
+            .expect("RelayConfig::validate checks upstream TLS pins");
+        put(
+            &mut hasher,
+            "upstream_tls_leaf_sha256.count",
+            &(normalized_pins.len() as u64).to_be_bytes(),
+        );
+        for (origin, pins) in normalized_pins {
+            put(&mut hasher, "upstream_tls.origin", origin.as_bytes());
+            put(
+                &mut hasher,
+                "upstream_tls.pins.count",
+                &(pins.len() as u64).to_be_bytes(),
+            );
+            for pin in pins {
+                put(&mut hasher, "upstream_tls.pin", pin.as_bytes());
+            }
         }
 
         hasher.finalize().into()
@@ -513,8 +588,6 @@ impl RelayConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── url_origin ──────────────────────────────────────────────────────
 
     #[test]
     fn origin_basic() {
@@ -539,11 +612,8 @@ mod tests {
 
     #[test]
     fn origin_rejects_userinfo() {
-        // `https://api.openai.com@evil.com` — the real host is evil.com.
         assert_eq!(url_origin("https://api.openai.com@evil.com"), None);
     }
-
-    // ── allowlist ───────────────────────────────────────────────────────
 
     #[test]
     fn allowlist_permits_same_origin() {
@@ -551,7 +621,6 @@ mod tests {
             allowed_upstreams: vec!["https://api.openai.com".to_string()],
             ..Default::default()
         };
-
         assert!(config
             .check_upstream_allowed("https://api.openai.com/v1/chat")
             .is_ok());
@@ -566,14 +635,9 @@ mod tests {
             allowed_upstreams: vec!["https://api.openai.com".to_string()],
             ..Default::default()
         };
-
-        // Must be blocked — the real host is api.openai.com.evil.com
-        assert!(
-            config
-                .check_upstream_allowed("https://api.openai.com.evil.com/steal")
-                .is_err(),
-            "subdomain impersonation must be blocked"
-        );
+        assert!(config
+            .check_upstream_allowed("https://api.openai.com.evil.com/steal")
+            .is_err());
     }
 
     #[test]
@@ -582,14 +646,9 @@ mod tests {
             allowed_upstreams: vec!["https://api.openai.com".to_string()],
             ..Default::default()
         };
-
-        // Must be blocked — the real host is evil.com (userinfo is ignored by browsers)
-        assert!(
-            config
-                .check_upstream_allowed("https://api.openai.com@evil.com/steal")
-                .is_err(),
-            "userinfo-based bypass must be blocked"
-        );
+        assert!(config
+            .check_upstream_allowed("https://api.openai.com@evil.com/steal")
+            .is_err());
     }
 
     #[test]
@@ -598,21 +657,14 @@ mod tests {
             allowed_upstreams: vec!["https://api.openai.com".to_string()],
             ..Default::default()
         };
-
-        assert!(config
-            .check_upstream_allowed("https://evil.com/steal")
-            .is_err());
+        assert!(config.check_upstream_allowed("https://evil.com/steal").is_err());
     }
 
     #[test]
     fn empty_allowlist_permits_all() {
         let config = RelayConfig::default();
-        assert!(config
-            .check_upstream_allowed("https://anything.com")
-            .is_ok());
+        assert!(config.check_upstream_allowed("https://anything.com").is_ok());
     }
-
-    // ── routing ─────────────────────────────────────────────────────────
 
     #[test]
     fn longest_prefix_wins() {
@@ -631,17 +683,9 @@ mod tests {
                 path: None,
             },
         );
-
-        let config = RelayConfig {
-            routes,
-            ..Default::default()
-        };
-
-        // "gpt-4-turbo" should match "gpt-4" (longer prefix), not "gpt-"
+        let config = RelayConfig { routes, ..Default::default() };
         let (url, _) = config.resolve_upstream("gpt-4-turbo");
         assert_eq!(url, "https://api.openai-special.com");
-
-        // "gpt-3.5" should match "gpt-"
         let (url, _) = config.resolve_upstream("gpt-3.5");
         assert_eq!(url, "https://api.openai.com");
     }
@@ -653,8 +697,6 @@ mod tests {
         assert_eq!(url, "https://api.openai.com");
     }
 
-    // ── validate ────────────────────────────────────────────────────────
-
     #[test]
     fn validate_catches_bad_routes() {
         let mut routes = BTreeMap::new();
@@ -665,17 +707,44 @@ mod tests {
                 path: None,
             },
         );
-
         let config = RelayConfig {
             allowed_upstreams: vec!["https://api.openai.com".to_string()],
             routes,
             ..Default::default()
         };
-
         assert!(config.validate().is_err());
     }
 
-    // ── config_hash ───────────────────────────────────────────────────────
+    #[test]
+    fn validate_rejects_authority_like_route_path() {
+        let mut routes = BTreeMap::new();
+        routes.insert(
+            "gpt-".to_string(),
+            ProviderConfig {
+                base_url: "https://api.openai.com".to_string(),
+                path: Some("@evil.example/steal".to_string()),
+            },
+        );
+        let config = RelayConfig {
+            routes,
+            allowed_upstreams: vec!["https://api.openai.com".to_string()],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn build_upstream_url_preserves_allowed_origin() {
+        let config = RelayConfig {
+            allowed_upstreams: vec!["https://api.openai.com".to_string()],
+            ..Default::default()
+        };
+        let url = config
+            .build_upstream_url("https://api.openai.com", "/v1/chat/completions")
+            .unwrap();
+        assert_eq!(url.as_str(), "https://api.openai.com/v1/chat/completions");
+        assert_eq!(url.host_str(), Some("api.openai.com"));
+    }
 
     #[test]
     fn config_hash_differs_when_path_changes() {
@@ -687,7 +756,6 @@ mod tests {
                 path: Some("/v1/chat/completions".to_string()),
             },
         );
-
         let mut routes_b = BTreeMap::new();
         routes_b.insert(
             "gpt-".to_string(),
@@ -696,20 +764,35 @@ mod tests {
                 path: Some("/v1/evil/exfiltrate".to_string()),
             },
         );
+        let config_a = RelayConfig { routes: routes_a, ..Default::default() };
+        let config_b = RelayConfig { routes: routes_b, ..Default::default() };
+        assert_ne!(config_a.config_hash(), config_b.config_hash());
+    }
 
-        let config_a = RelayConfig {
-            routes: routes_a,
-            ..Default::default()
-        };
-        let config_b = RelayConfig {
-            routes: routes_b,
-            ..Default::default()
-        };
-
+    #[test]
+    fn config_hash_v3_breaks_legacy_delimiter_collision() {
+        let mut routes_a = BTreeMap::new();
+        routes_a.insert(
+            "gpt-".to_string(),
+            ProviderConfig {
+                base_url: "https://api.openai.com/|path:@evil.example".to_string(),
+                path: None,
+            },
+        );
+        let mut routes_b = BTreeMap::new();
+        routes_b.insert(
+            "gpt-".to_string(),
+            ProviderConfig {
+                base_url: "https://api.openai.com/".to_string(),
+                path: Some("@evil.example".to_string()),
+            },
+        );
+        let config_a = RelayConfig { routes: routes_a, ..Default::default() };
+        let config_b = RelayConfig { routes: routes_b, ..Default::default() };
         assert_ne!(
             config_a.config_hash(),
             config_b.config_hash(),
-            "configs differing only in path must produce different hashes"
+            "length-prefixed schema must distinguish legacy delimiter collision inputs"
         );
     }
 
@@ -723,7 +806,6 @@ mod tests {
                 path: None,
             },
         );
-
         let mut routes_b = BTreeMap::new();
         routes_b.insert(
             "gpt-".to_string(),
@@ -732,21 +814,9 @@ mod tests {
                 path: Some("/v1/chat/completions".to_string()),
             },
         );
-
-        let config_a = RelayConfig {
-            routes: routes_a,
-            ..Default::default()
-        };
-        let config_b = RelayConfig {
-            routes: routes_b,
-            ..Default::default()
-        };
-
-        assert_ne!(
-            config_a.config_hash(),
-            config_b.config_hash(),
-            "config with path=None vs path=Some must differ"
-        );
+        let config_a = RelayConfig { routes: routes_a, ..Default::default() };
+        let config_b = RelayConfig { routes: routes_b, ..Default::default() };
+        assert_ne!(config_a.config_hash(), config_b.config_hash());
     }
 
     #[test]
@@ -763,12 +833,7 @@ mod tests {
             ),
             ..Default::default()
         };
-
-        assert_ne!(
-            config_a.config_hash(),
-            config_b.config_hash(),
-            "artifact digest changes must alter the config hash bound into REPORTDATA"
-        );
+        assert_ne!(config_a.config_hash(), config_b.config_hash());
     }
 
     #[test]
@@ -777,7 +842,6 @@ mod tests {
             release_artifact_digest: Some("not-a-digest".to_string()),
             ..Default::default()
         };
-
         assert!(config.validate().is_err());
     }
 
@@ -792,7 +856,6 @@ mod tests {
             upstream_tls_leaf_sha256: pins,
             ..Default::default()
         };
-
         assert_eq!(
             config
                 .upstream_tls_pins_for("https://api.openai.com/v1/chat/completions")
@@ -815,7 +878,6 @@ mod tests {
             upstream_tls_leaf_sha256: pins,
             ..Default::default()
         };
-
         assert!(config.validate().is_err());
     }
 
@@ -830,7 +892,6 @@ mod tests {
             upstream_tls_leaf_sha256: pins,
             ..Default::default()
         };
-
         assert!(config.validate().is_err());
     }
 
@@ -849,7 +910,6 @@ mod tests {
             upstream_tls_leaf_sha256: pins,
             ..Default::default()
         };
-
         assert_eq!(
             config
                 .upstream_tls_pin_hosts()
@@ -884,7 +944,6 @@ mod tests {
             upstream_tls_leaf_sha256: pins_b,
             ..Default::default()
         };
-
         assert_ne!(config_a.config_hash(), config_b.config_hash());
     }
 
@@ -905,7 +964,6 @@ mod tests {
             },
             ..Default::default()
         };
-
         assert_ne!(config_a.config_hash(), config_b.config_hash());
         assert_ne!(config_a.config_hash(), config_c.config_hash());
         assert_ne!(config_b.config_hash(), config_c.config_hash());
@@ -921,7 +979,6 @@ mod tests {
             },
             ..Default::default()
         };
-
         assert_ne!(config_a.config_hash(), config_b.config_hash());
     }
 
@@ -934,7 +991,6 @@ mod tests {
             },
             ..Default::default()
         };
-
         assert!(config.validate().is_err());
     }
 
@@ -947,7 +1003,6 @@ mod tests {
             },
             ..Default::default()
         };
-
         assert!(config.validate().is_err());
     }
 

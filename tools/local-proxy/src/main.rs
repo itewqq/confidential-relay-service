@@ -57,6 +57,7 @@ struct Cli {
     gcp_cs_audience: String,
 
     /// Expected Confidential Space workload container image digest (`sha256:...`).
+    /// Required for production GCP verification to prevent signed-image rollback.
     #[arg(long, env = "TRUSTED_RELAY_GCP_CS_IMAGE_DIGEST")]
     gcp_cs_image_digest: Option<String>,
 
@@ -65,6 +66,9 @@ struct Cli {
     gcp_cs_image_reference: Option<String>,
 
     /// Expected Confidential Space container signature key ID. Can be repeated.
+    /// This may further constrain a pinned image, but key-only verification is
+    /// accepted only in --allow-audit mode because it permits rollback to any
+    /// image signed by the same key.
     #[arg(
         long,
         env = "TRUSTED_RELAY_GCP_CS_SIGNATURE_KEY_ID",
@@ -157,6 +161,12 @@ fn verifier_for_backend(cli: &Cli) -> Result<Arc<dyn Verifier>> {
         AttestationBackend::GcpConfidentialSpace => {
             #[cfg(feature = "gcp-confidential-space")]
             {
+                if !cli.allow_audit && cli.gcp_cs_image_digest.is_none() {
+                    anyhow::bail!(
+                        "production GCP Confidential Space verification requires an exact --gcp-cs-image-digest; signature-key-only verification permits rollback to older images signed by the same key"
+                    );
+                }
+
                 let mut policy =
                     relay_attest::gcp_confidential_space::GcpConfidentialSpacePolicy::new(
                         cli.gcp_cs_audience.clone(),

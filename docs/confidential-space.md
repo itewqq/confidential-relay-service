@@ -1,9 +1,10 @@
 # Google Cloud Confidential Space Deployment
 
 Confidential Space is the chosen GCP production path for Trusted Relay. The
-release identity is the Google-signed workload-container claim
-`submods.container.image_digest` or `submods.container.image_signatures`, not raw
-GCP SEV-SNP `MEASUREMENT`.
+production workload identity is the Google-attested workload-container
+`submods.container.image_digest`. Signature-key claims can be useful for audit or
+release-channel inspection, but production prompt traffic must pin an exact image
+digest so the operator cannot roll back to an older image signed by the same key.
 
 ## Attestation Binding
 
@@ -30,7 +31,13 @@ The verifier checks:
 - `dbgstat == disabled-since-boot`.
 - `secboot == true`.
 - Optional service account, project ID, zone, and instance name pins.
-- Container image digest and/or allowed image signature key ID.
+- The exact workload container image digest for production clients.
+
+`RelayConfig::config_hash()` uses schema v3. Security-sensitive values are encoded
+with explicit length prefixes instead of delimiter-separated text, so route/base/path
+field boundaries cannot be made ambiguous. Upgrading from a v2 release therefore
+changes the expected config hash even if the human-readable configuration is the
+same; recompute and redistribute the reviewed expected hash during deployment.
 
 ## Build And Push
 
@@ -66,12 +73,20 @@ tools/gcp/launch-confidential-space.sh \
 Do not pass provider keys through metadata. The image allowlists only non-secret
 runtime configuration and the private admin listener address. Provider keys are
 pushed later from a private operator service to the private admin port.
-`TRUSTED_RELAY_UPSTREAM_TLS_LEAF_SHA256` is non-secret config in
-`ORIGIN=sha256:<64-hex>` form; it is folded into `RelayConfig::config_hash()`.
+`TRUSTED_RELAY_UPSTREAM_TLS_LEAF_SHA256` is non-secret config and is folded into
+`RelayConfig::config_hash()`.
+
+`TRUSTED_RELAY_RELEASE_ARTIFACT_DIGEST` is also config-hashed release metadata,
+but it is **not attestation evidence**: the operator supplies it as workload
+configuration. Do not treat it as a substitute for the Confidential Space
+`container.image_digest` claim. Production clients must compare the platform-
+attested image digest directly.
+
 The config hash also covers security-relevant runtime policy: whether client
 provider auth is allowed, whether the private admin endpoint is enabled, the
-provider auth scheme, and the relay-owned body logging policy. It deliberately
-excludes deploy-only addresses and secret token material.
+provider auth scheme, relay-owned body logging policy, routes, allowlists,
+request limits, timeouts, and upstream TLS pins. It deliberately excludes
+deploy-only addresses and secret token material.
 
 ## Inject Provider Credential
 
@@ -107,7 +122,7 @@ cargo run -p trusted-relay-online-check --no-default-features \
   --print-only
 ```
 
-Strict mode enforces image/config pins:
+For production verification, pin the exact image digest and config hash:
 
 ```bash
 cargo run -p trusted-relay-online-check --no-default-features \
@@ -127,7 +142,8 @@ cargo run -p trusted-relay-online-check --no-default-features \
   --health
 ```
 
-The local proxy uses the same policy:
+The local proxy enforces the same production requirement and rejects GCP
+production startup if only a signature key is supplied:
 
 ```bash
 trusted-relay-local \
@@ -140,6 +156,14 @@ trusted-relay-local \
   --gcp-cs-zone "$GCP_ZONE" \
   --gcp-cs-image-digest "$IMAGE_DIGEST"
 ```
+
+## Egress Invariants
+
+The relay does not follow upstream HTTP redirects. A redirect is a new egress
+decision and must instead be represented in reviewed, attested configuration.
+Route path overrides are validated as absolute paths and cannot be interpreted
+as URL authorities. The fully constructed request URL is checked against the
+origin allowlist immediately before the request is sent.
 
 ## Negative Test
 
