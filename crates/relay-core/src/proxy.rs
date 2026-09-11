@@ -3,7 +3,11 @@
 //!
 //! **Security invariants:**
 //! - No filesystem writes of request/response data
-//! - No payload content in logs (only metadata: timestamp, model, status code)
+//! - No payload-derived content in logs
+//! - Final upstream URLs are constructed as paths on attested base URLs and
+//!   checked against the allowlist immediately before use
+//! - Redirects are not followed, so an allowed upstream cannot redirect a
+//!   request body to a different origin
 //! - All request/response data lives in memory and is dropped after the handler returns
 
 #![deny(unsafe_code)]
@@ -55,9 +59,14 @@ pub struct AppState {
 
 /// Build the upstream HTTP client with normal WebPKI/hostname validation and,
 /// when configured, handshake-time leaf-certificate pin checks.
+///
+/// Redirects are deliberately disabled. A provider redirect is a new egress
+/// decision and must be represented in the attested configuration instead of
+/// being followed implicitly by the HTTP client.
 pub fn build_upstream_http_client(config: &RelayConfig) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.upstream_timeout_secs));
+        .timeout(std::time::Duration::from_secs(config.upstream_timeout_secs))
+        .redirect(reqwest::redirect::Policy::none());
 
     let pins_by_host = config
         .upstream_tls_pin_hosts()
@@ -75,12 +84,14 @@ pub fn build_upstream_http_client(config: &RelayConfig) -> anyhow::Result<reqwes
 /// POST /v1/chat/completions — proxy to upstream.
 ///
 /// Flow:
-/// 1. Extract the model name from the JSON body (minimal parsing)
-/// 2. Resolve upstream URL from config
-/// 3. Forward the request body verbatim to the upstream
-/// 4. Stream the response back to the client (supports SSE for streaming)
+/// 1. Extract the model name from the JSON body for routing only
+/// 2. Resolve attested upstream base/path configuration
+/// 3. Construct and allowlist-check the final URL without URL-reference joining
+/// 4. Forward the request body verbatim to the upstream
+/// 5. Stream the response back to the client (supports SSE for streaming)
 ///
-/// No request or response body content is logged or persisted.
+/// No request or response body content, including the payload-derived model
+/// value, is logged or persisted.
 pub async fn proxy_chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -94,21 +105,16 @@ pub async fn proxy_chat_completions(
         });
     }
 
-    // Minimal JSON parsing: extract model name for routing.
-    // We parse only what we need and avoid holding the full parsed structure.
+    // Minimal JSON parsing: extract model name for routing only. Do not log it.
     let model = extract_model_name(&body).unwrap_or_default();
 
-    // Resolve upstream.
     let (upstream_base, path_override) = state.config.resolve_upstream(&model);
     let upstream_path = path_override.unwrap_or("/v1/chat/completions");
-    let upstream_url = format!("{}{}", upstream_base.trim_end_matches('/'), upstream_path);
-
-    // Security check: verify the resolved upstream is in the allowlist.
-    state
+    let upstream_url = state
         .config
-        .check_upstream_allowed(upstream_base)
+        .build_upstream_url(upstream_base, upstream_path)
         .map_err(|e| {
-            tracing::error!(upstream = %upstream_base, "blocked request to disallowed upstream");
+            tracing::error!("blocked request with invalid or disallowed final upstream URL");
             AppError::Internal(format!("upstream not allowed: {e}"))
         })?;
 
@@ -147,10 +153,9 @@ pub async fn proxy_chat_completions(
         reqwest::header::HeaderValue::from_static("application/json"),
     );
 
-    // Send to upstream.
     let upstream_resp = state
         .http_client
-        .post(&upstream_url)
+        .post(upstream_url.clone())
         .headers(upstream_headers)
         .body(body)
         .send()
@@ -165,10 +170,9 @@ pub async fn proxy_chat_completions(
         .to_string();
     let response_headers = filtered_response_headers(upstream_resp.headers());
 
-    // Log metadata only (never payload).
+    // Log non-payload metadata only. The upstream URL is attested config-derived.
     let latency = start.elapsed();
     tracing::info!(
-        model = %model,
         upstream = %upstream_url,
         status = %status.as_u16(),
         latency_ms = %latency.as_millis(),
@@ -178,11 +182,9 @@ pub async fn proxy_chat_completions(
     let provider_auth_failed =
         using_injected_provider_credential && matches!(status.as_u16(), 401 | 403);
 
-    // Check if this is a streaming response (SSE).
     let is_streaming = content_type.contains("text/event-stream");
 
     if is_streaming {
-        // Stream SSE chunks back without buffering the full response.
         let stream = upstream_resp.bytes_stream();
         let body = Body::from_stream(stream);
 
@@ -201,7 +203,6 @@ pub async fn proxy_chat_completions(
 
         Ok(response)
     } else {
-        // Non-streaming: read full response and forward.
         let resp_body = upstream_resp
             .bytes()
             .await
@@ -354,6 +355,7 @@ mod tests {
     use super::*;
     use rcgen::{generate_simple_self_signed, CertifiedKey};
     use rustls::client::danger::ServerCertVerifier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn pinned_verifier_for_localhost() -> (PinnedServerCertVerifier, Vec<u8>) {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -419,5 +421,62 @@ mod tests {
             result.is_err(),
             "wrong pin must fail during TLS verification"
         );
+    }
+
+    #[tokio::test]
+    async fn upstream_client_does_not_follow_redirects() {
+        let target_hits = Arc::new(AtomicUsize::new(0));
+        let hits = target_hits.clone();
+        let target_app = axum::Router::new().route(
+            "/steal",
+            axum::routing::post(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    "unexpected"
+                }
+            }),
+        );
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(target_listener, target_app).await.unwrap();
+        });
+
+        let location = format!("http://{target_addr}/steal");
+        let source_app = axum::Router::new().route(
+            "/start",
+            axum::routing::post(move || {
+                let location = location.clone();
+                async move {
+                    Response::builder()
+                        .status(StatusCode::TEMPORARY_REDIRECT)
+                        .header(axum::http::header::LOCATION, location)
+                        .body(Body::empty())
+                        .unwrap()
+                }
+            }),
+        );
+        let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let source_addr = source_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(source_listener, source_app).await.unwrap();
+        });
+
+        let client = build_upstream_http_client(&RelayConfig::default()).unwrap();
+        let response = client
+            .post(format!("http://{source_addr}/start"))
+            .body("secret prompt")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        tokio::task::yield_now().await;
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
     }
 }

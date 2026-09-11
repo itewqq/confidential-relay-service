@@ -2,6 +2,10 @@
 //!
 //! # Security: Fail-closed verifier selection
 //!
+//! Callers must explicitly choose a verification policy. There is deliberately
+//! no default `Audit` policy because Audit verifies TEE presence but does not pin
+//! operator-controlled workload code.
+//!
 //! For `Strict`, `Audit`, and `TrustOnFirstUse` policies, you **must** either:
 //! - Provide an explicit verifier via `.verifier(Arc::new(SevSnpVerifier))`, or
 //! - Enable the `sev-snp` feature so the SDK can auto-select the correct backend.
@@ -30,7 +34,7 @@ pub struct TrustedRelayClient {
 pub struct TrustedRelayClientBuilder {
     endpoint: String,
     api_key: Option<String>,
-    policy: VerificationPolicy,
+    policy: Option<VerificationPolicy>,
     /// Explicit verifier override. If set, the builder uses this instead of
     /// auto-selecting based on features. Required for production policies
     /// unless a TEE feature is enabled.
@@ -57,8 +61,11 @@ impl TrustedRelayClientBuilder {
     }
 
     /// Set the verification policy.
+    ///
+    /// This is mandatory. Callers that intentionally want diagnostic Audit mode
+    /// must opt into it explicitly instead of inheriting it as a default.
     pub fn verification(mut self, policy: VerificationPolicy) -> Self {
-        self.policy = policy;
+        self.policy = Some(policy);
         self
     }
 
@@ -88,11 +95,18 @@ impl TrustedRelayClientBuilder {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - No verification policy was explicitly selected.
     /// - A production policy (`Strict`/`Audit`/`TOFU`) is used without a verifier
     ///   and without a TEE verifier feature enabled.
     /// - `MockDev` is used without the `mock` feature.
     pub fn build(self) -> anyhow::Result<TrustedRelayClient> {
-        let verifier: Arc<dyn Verifier> = match &self.policy {
+        let policy = self.policy.ok_or_else(|| {
+            anyhow::anyhow!(
+                "verification policy must be selected explicitly; use Strict/GcpConfidentialSpace for operator-resistant verification or opt into Audit intentionally"
+            )
+        })?;
+
+        let verifier: Arc<dyn Verifier> = match &policy {
             VerificationPolicy::GcpConfidentialSpace {
                 audience,
                 image_digest,
@@ -123,7 +137,6 @@ impl TrustedRelayClientBuilder {
                 }
             }
             VerificationPolicy::MockDev => {
-                // MockDev: only use mock verifier, only if explicitly enabled.
                 if self.explicit_verifier.is_some() {
                     tracing::warn!(
                         "explicit verifier provided with MockDev policy — using mock verifier instead"
@@ -138,10 +151,8 @@ impl TrustedRelayClientBuilder {
                     anyhow::bail!("MockDev policy requires the 'mock' feature");
                 }
             }
-            // Production policies: Strict, Audit, TrustOnFirstUse.
-            // These MUST use a real verifier — never fall back to mock.
             _production_policy => {
-                if matches!(self.policy, VerificationPolicy::TrustOnFirstUse) {
+                if matches!(&policy, VerificationPolicy::TrustOnFirstUse) {
                     anyhow::bail!(
                         "VerificationPolicy::TrustOnFirstUse is not implemented yet. \
                          Use Strict with an expected measurement, Audit, or MockDev."
@@ -149,11 +160,8 @@ impl TrustedRelayClientBuilder {
                 }
 
                 if let Some(v) = self.explicit_verifier {
-                    // User provided an explicit verifier — use it.
                     v
                 } else {
-                    // Auto-select based on enabled features.
-                    // IMPORTANT: mock is NEVER used for production policies.
                     #[cfg(feature = "sev-snp")]
                     {
                         tracing::info!("auto-selected SEV-SNP verifier for production policy");
@@ -161,11 +169,9 @@ impl TrustedRelayClientBuilder {
                     }
                     #[cfg(not(feature = "sev-snp"))]
                     {
-                        // There is no safe generic default for Audit/Strict on
-                        // Confidential Space because it needs an image policy.
                         anyhow::bail!(
                             "production verification policy ({:?}) requires a concrete verifier. Enable 'sev-snp', provide one via .verifier(), or use VerificationPolicy::GcpConfidentialSpace with an image digest.",
-                            self.policy
+                            policy
                         );
                     }
                 }
@@ -173,7 +179,7 @@ impl TrustedRelayClientBuilder {
         };
 
         if matches!(
-            self.policy,
+            &policy,
             VerificationPolicy::Strict { .. } | VerificationPolicy::GcpConfidentialSpace { .. }
         ) && self.expected_config_hash.is_none()
         {
@@ -187,7 +193,7 @@ impl TrustedRelayClientBuilder {
             anyhow::bail!("relay endpoint must not be empty");
         }
 
-        let expected_measurement = self.policy.expected_measurement().map(|m| m.to_vec());
+        let expected_measurement = policy.expected_measurement().map(|m| m.to_vec());
         let tls_config =
             attested_client_config(verifier, expected_measurement, self.expected_config_hash);
 
@@ -204,12 +210,13 @@ impl TrustedRelayClientBuilder {
 }
 
 impl TrustedRelayClient {
-    /// Create a new builder.
+    /// Create a new builder. A verification policy must be selected explicitly
+    /// before calling [`TrustedRelayClientBuilder::build`].
     pub fn builder() -> TrustedRelayClientBuilder {
         TrustedRelayClientBuilder {
             endpoint: String::new(),
             api_key: None,
-            policy: VerificationPolicy::Audit,
+            policy: None,
             explicit_verifier: None,
             expected_config_hash: None,
         }
@@ -238,5 +245,22 @@ impl TrustedRelayClient {
 
         let chat_response: ChatResponse = resp.json().await?;
         Ok(chat_response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_requires_explicit_verification_policy() {
+        let error = TrustedRelayClient::builder()
+            .endpoint("https://relay.example.com:8443")
+            .build()
+            .err()
+            .expect("builder without verification policy must fail");
+        assert!(error
+            .to_string()
+            .contains("verification policy must be selected explicitly"));
     }
 }
